@@ -10,6 +10,8 @@ import {
 
 export const APP_META_UPDATED_EVENT = "chatgpt2api:app-meta-updated";
 export const DEFAULT_LOGIN_PAGE_IMAGE = "/login-panel-illustration.svg";
+export const DEFAULT_APP_TITLE = "Prism AI Studio";
+export const DEFAULT_PROJECT_NAME = "Prism AI";
 
 export type AppMeta = {
   app_title: string;
@@ -22,8 +24,8 @@ export type AppMeta = {
 };
 
 export const defaultAppMeta: AppMeta = {
-  app_title: "chatgpt2api",
-  project_name: "chatgpt2api",
+  app_title: DEFAULT_APP_TITLE,
+  project_name: DEFAULT_PROJECT_NAME,
   login_page_image_url: "",
   login_page_image_mode: "contain",
   login_page_image_zoom: LOGIN_PAGE_IMAGE_DEFAULT_TRANSFORM.zoom,

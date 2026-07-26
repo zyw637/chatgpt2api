@@ -18,10 +18,12 @@ import (
 	"os"
 	"path"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
 
+	"chatgpt2api/internal/backend"
 	"chatgpt2api/internal/config"
 	"chatgpt2api/internal/protocol"
 	"chatgpt2api/internal/service"
@@ -35,30 +37,37 @@ import (
 
 const (
 	maxLoginPageImageSize      = 10 << 20
+	maxMultipartImageBytes     = 25 << 20
+	maxMultipartImageCount     = 16
+	serviceShutdownTimeout     = 10 * time.Second
 	imageThumbnailCacheControl = "public, max-age=31536000, immutable"
 	authSessionCookieName      = "chatgpt2api_session"
 )
 
 type App struct {
-	config     *config.Store
-	auth       *service.AuthService
-	accounts   *service.AccountService
-	billing    *service.BillingService
-	logs       *service.LogService
-	logger     *service.Logger
-	proxy      *service.ProxyService
-	engine     *protocol.Engine
-	images     *service.ImageService
-	tasks      *service.ImageTaskService
-	announce   *service.AnnouncementService
-	prompts    *service.PromptFavoriteService
-	cpa        *service.CPAConfig
-	cpaImport  *service.CPAImportService
-	sub2       *service.Sub2APIConfig
-	sub2Import *service.Sub2APIService
-	register   *service.RegisterService
-	update     *service.UpdateService
-	cancel     context.CancelFunc
+	config       *config.Store
+	storage      storage.Backend
+	auth         *service.AuthService
+	accounts     *service.AccountService
+	billing      *service.BillingService
+	logs         *service.LogService
+	logger       *service.Logger
+	proxy        *service.ProxyService
+	engine       *protocol.Engine
+	images       *service.ImageService
+	tasks        *service.ImageTaskService
+	external     *service.ExternalImageService
+	chatHistory  *service.ExternalChatHistoryService
+	imageHistory *service.ImageConversationHistoryService
+	loginLimit   *loginAttemptLimiter
+	announce     *service.AnnouncementService
+	prompts      *service.PromptFavoriteService
+	cpa          *service.CPAConfig
+	cpaImport    *service.CPAImportService
+	sub2         *service.Sub2APIConfig
+	sub2Import   *service.Sub2APIService
+	update       *service.UpdateService
+	cancel       context.CancelFunc
 }
 
 func NewApp() (*App, error) {
@@ -70,23 +79,47 @@ func NewApp() (*App, error) {
 	if err != nil {
 		return nil, err
 	}
+	closeStorage := func() {
+		if closer, ok := storageBackend.(interface{ Close() error }); ok {
+			_ = closer.Close()
+		}
+	}
 	ctx, cancel := context.WithCancel(context.Background())
 	logs := service.NewLogService(storageBackend)
 	logger, err := service.NewLogger(cfg.DataDir, cfg.LogLevels)
 	if err != nil {
 		cancel()
+		closeStorage()
 		return nil, err
+	}
+	cleanupInitialization := func() {
+		cancel()
+		_ = logger.Close()
+		closeStorage()
 	}
 	proxy := service.NewProxyService(cfg)
 	accounts := service.NewAccountService(storageBackend, cfg, proxy, logs)
+	if err := accounts.InitializationError(); err != nil {
+		cleanupInitialization()
+		return nil, fmt.Errorf("load accounts: %w", err)
+	}
 	auth := service.NewAuthService(storageBackend)
+	if err := auth.InitializationError(); err != nil {
+		cleanupInitialization()
+		return nil, err
+	}
 	billing := service.NewBillingService(storageBackend, cfg)
-	auth.SetUserCreatedHook(func(userID string) {
-		billing.InitializeUserDefaults(userID)
+	if err := billing.InitializationError(); err != nil {
+		cleanupInitialization()
+		return nil, fmt.Errorf("load billing data: %w", err)
+	}
+	auth.SetUserCreatedHook(func(userID string) error {
+		_, err := billing.InitializeUserDefaults(userID)
+		return err
 	})
 	bootstrap, err := auth.EnsureBootstrapAdmin(cfg.AdminUsername(), cfg.AdminPassword())
 	if err != nil {
-		cancel()
+		cleanupInitialization()
 		return nil, err
 	}
 	if bootstrap.Created && bootstrap.Generated {
@@ -95,11 +128,34 @@ func NewApp() (*App, error) {
 	}
 	documentStore, _ := storageBackend.(storage.JSONDocumentBackend)
 	imageSessions := service.NewImageConversationSessionService(filepath.Join(cfg.DataDir, "image_conversation_sessions.json"), storageBackend)
+	if err := imageSessions.InitializationError(); err != nil {
+		cleanupInitialization()
+		return nil, err
+	}
+	announce := service.NewAnnouncementService(storageBackend)
+	if err := announce.InitializationError(); err != nil {
+		cleanupInitialization()
+		return nil, fmt.Errorf("load announcements: %w", err)
+	}
+	cpa := service.NewCPAConfig(storageBackend)
+	if err := cpa.InitializationError(); err != nil {
+		cleanupInitialization()
+		return nil, fmt.Errorf("load CPA configuration: %w", err)
+	}
+	sub2 := service.NewSub2APIConfig(storageBackend)
+	if err := sub2.InitializationError(); err != nil {
+		cleanupInitialization()
+		return nil, fmt.Errorf("load Sub2API configuration: %w", err)
+	}
 	engine := &protocol.Engine{Accounts: accounts, Config: cfg, Storage: documentStore, Proxy: proxy, Logger: logger, ImageConversationSessions: imageSessions}
-	app := &App{config: cfg, auth: auth, accounts: accounts, billing: billing, logs: logs, logger: logger, proxy: proxy, engine: engine, images: service.NewImageService(cfg, storageBackend), announce: service.NewAnnouncementService(storageBackend), prompts: service.NewPromptFavoriteService(storageBackend), cpa: service.NewCPAConfig(storageBackend), sub2: service.NewSub2APIConfig(storageBackend), update: newUpdateService(cfg), cancel: cancel}
+	app := &App{config: cfg, storage: storageBackend, auth: auth, accounts: accounts, billing: billing, logs: logs, logger: logger, proxy: proxy, engine: engine, images: service.NewImageService(cfg, storageBackend), chatHistory: service.NewExternalChatHistoryService(storageBackend), imageHistory: service.NewImageConversationHistoryService(storageBackend), announce: announce, prompts: service.NewPromptFavoriteService(storageBackend), cpa: cpa, sub2: sub2, update: newUpdateService(cfg), loginLimit: newLoginAttemptLimiter(), cancel: cancel}
 	app.cpaImport = service.NewCPAImportService(app.cpa, accounts, proxy)
 	app.sub2Import = service.NewSub2APIService(app.sub2, accounts)
-	app.register = service.NewRegisterService(accounts, storageBackend)
+	app.external = service.NewExternalImageService(storageBackend, cfg, app.images, logger)
+	if err := app.external.InitializationError(); err != nil {
+		cleanupInitialization()
+		return nil, err
+	}
 	app.tasks = service.NewStoredImageTaskService(storageBackend,
 		func(ctx context.Context, identity service.Identity, payload map[string]any) (map[string]any, error) {
 			return app.runLoggedImageTask(ctx, identity, payload, "/api/creation-tasks/image-generations", "文生图", func(ctx context.Context, payload map[string]any) (map[string]any, error) {
@@ -121,8 +177,19 @@ func NewApp() (*App, error) {
 		cfg.UserDefaultConcurrentLimit,
 		cfg.UserDefaultRPMLimit,
 	)
+	if err := app.tasks.InitializationError(); err != nil {
+		app.external.Close()
+		cleanupInitialization()
+		return nil, fmt.Errorf("load creation tasks: %w", err)
+	}
+	app.tasks.SetLogger(logger)
 	app.tasks.SetBillingService(billing)
 	app.tasks.SetTaskTimeoutGetter(func() time.Duration {
+		return time.Duration(app.config.ImageTaskTimeoutSeconds()) * time.Second
+	})
+	// Keep official upstream browser HTTP client timeout aligned with the
+	// settings image-task timeout so long generations are not cut at 300s.
+	backend.SetBrowserHTTPTimeoutGetter(func() time.Duration {
 		return time.Duration(app.config.ImageTaskTimeoutSeconds()) * time.Second
 	})
 	accounts.StartLimitedWatcher(ctx, time.Duration(cfg.RefreshAccountIntervalMinute())*time.Minute)
@@ -148,15 +215,30 @@ func (a *App) Close() {
 	if a.cancel != nil {
 		a.cancel()
 	}
+	servicesStopped := true
+	if a.tasks != nil && !a.tasks.CloseWithTimeout(serviceShutdownTimeout) {
+		servicesStopped = false
+		if a.logger != nil {
+			a.logger.Warning("image task service shutdown timed out")
+		}
+	}
+	if a.external != nil && !a.external.CloseWithTimeout(serviceShutdownTimeout) {
+		servicesStopped = false
+		if a.logger != nil {
+			a.logger.Warning("external image service shutdown timed out")
+		}
+	}
+	if !servicesStopped && a.logger != nil {
+		a.logger.Warning("application shutdown timed out; skipping backend close")
+	}
+	if !servicesStopped {
+		return
+	}
 	if a.logger != nil {
 		_ = a.logger.Close()
 	}
-	if a.config != nil {
-		if backend, err := a.config.StorageBackend(); err == nil {
-			if closer, ok := backend.(interface{ Close() error }); ok {
-				_ = closer.Close()
-			}
-		}
+	if closer, ok := a.storage.(interface{ Close() error }); ok {
+		_ = closer.Close()
 	}
 }
 
@@ -180,7 +262,7 @@ func (a *App) handleImageGenerations(w http.ResponseWriter, r *http.Request) {
 	}
 	body, err := readJSONMap(r)
 	if err != nil {
-		util.WriteError(w, http.StatusBadRequest, "invalid json body")
+		writeRequestBodyError(w, err, "invalid json body")
 		return
 	}
 	body["owner_id"] = identityScope(identity)
@@ -211,7 +293,7 @@ func (a *App) handleImageEdits(w http.ResponseWriter, r *http.Request) {
 	}
 	body, images, err := readMultipartImageBody(r)
 	if err != nil {
-		util.WriteError(w, http.StatusBadRequest, err.Error())
+		writeRequestBodyError(w, err, err.Error())
 		return
 	}
 	if n := util.ToInt(body["n"], 1); n < 1 || n > 4 {
@@ -251,7 +333,7 @@ func (a *App) handleChatCompletions(w http.ResponseWriter, r *http.Request) {
 	}
 	body, err := readJSONMap(r)
 	if err != nil {
-		util.WriteError(w, http.StatusBadRequest, "invalid json body")
+		writeRequestBodyError(w, err, "invalid json body")
 		return
 	}
 	body["owner_id"] = identityScope(identity)
@@ -277,7 +359,7 @@ func (a *App) handleResponses(w http.ResponseWriter, r *http.Request) {
 	}
 	body, err := readJSONMap(r)
 	if err != nil {
-		util.WriteError(w, http.StatusBadRequest, "invalid json body")
+		writeRequestBodyError(w, err, "invalid json body")
 		return
 	}
 	body["owner_id"] = identityScope(identity)
@@ -307,7 +389,7 @@ func (a *App) handleMessages(w http.ResponseWriter, r *http.Request) {
 	}
 	body, err := readJSONMap(r)
 	if err != nil {
-		util.WriteError(w, http.StatusBadRequest, "invalid json body")
+		writeRequestBodyError(w, err, "invalid json body")
 		return
 	}
 	model := firstNonEmpty(util.Clean(body["model"]), "auto")
@@ -318,7 +400,7 @@ func (a *App) handleMessages(w http.ResponseWriter, r *http.Request) {
 }
 
 func (a *App) writeProtocol(w http.ResponseWriter, r *http.Request, result map[string]any, stream *protocol.StreamResult, err error, sseKind, endpoint, model string, identity service.Identity, summary, visibility string, billingRef service.BillingReference, imagePayloads ...map[string]any) {
-	start := time.Now()
+	start := requestStartedAt(r.Context())
 	requestCapture := requestAuditCapture(r.Context())
 	if err != nil {
 		a.logCall(r.Context(), identity, summary, r.Method, endpoint, model, start, "failed", protocolErrorHTTPStatus(err), err.Error(), nil, requestCapture)
@@ -433,16 +515,27 @@ func (a *App) writeProtocolError(w http.ResponseWriter, err error) {
 func (a *App) handleLogin(w http.ResponseWriter, r *http.Request) {
 	body, err := readJSONMap(r)
 	if err != nil {
-		util.WriteError(w, http.StatusBadRequest, "invalid json body")
+		writeRequestBodyError(w, err, "invalid json body")
 		return
 	}
-	identity, token, err := a.auth.LoginPassword(util.Clean(body["username"]), util.Clean(body["password"]))
+	username := util.Clean(body["username"])
+	ip := clientIP(r)
+	if allowed, retryAfter := a.loginLimit.Allow(ip, username); !allowed {
+		w.Header().Set("Retry-After", strconv.FormatInt(max(1, int64(retryAfter/time.Second)), 10))
+		util.WriteError(w, http.StatusTooManyRequests, "too many login attempts")
+		return
+	}
+	identity, token, err := a.auth.LoginPassword(username, util.Clean(body["password"]))
 	if err != nil {
+		if service.IsPasswordLoginFailure(err) {
+			a.loginLimit.RecordFailure(ip, username)
+		}
 		util.WriteError(w, http.StatusBadRequest, err.Error())
 		return
 	}
+	a.loginLimit.Reset(ip, username)
 	setAuthSessionCookie(w, r, token)
-	a.writeLoginResponse(w, *identity, token)
+	a.writeLoginResponse(w, *identity)
 }
 
 func (a *App) handleSession(w http.ResponseWriter, r *http.Request) {
@@ -450,10 +543,7 @@ func (a *App) handleSession(w http.ResponseWriter, r *http.Request) {
 	if !ok {
 		return
 	}
-	if token := requestBearerToken(r); token != "" {
-		setAuthSessionCookie(w, r, token)
-	}
-	a.writeLoginResponse(w, identity, "")
+	a.writeLoginResponse(w, identity)
 }
 
 func (a *App) handleAccountRegister(w http.ResponseWriter, r *http.Request) {
@@ -463,7 +553,7 @@ func (a *App) handleAccountRegister(w http.ResponseWriter, r *http.Request) {
 	}
 	body, err := readJSONMap(r)
 	if err != nil {
-		util.WriteError(w, http.StatusBadRequest, "invalid json body")
+		writeRequestBodyError(w, err, "invalid json body")
 		return
 	}
 	identity, token, err := a.auth.RegisterPasswordUser(util.Clean(body["username"]), util.Clean(body["password"]), util.Clean(body["name"]))
@@ -472,7 +562,7 @@ func (a *App) handleAccountRegister(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	setAuthSessionCookie(w, r, token)
-	a.writeLoginResponse(w, *identity, token)
+	a.writeLoginResponse(w, *identity)
 }
 
 func (a *App) handleLogout(w http.ResponseWriter, r *http.Request) {
@@ -480,16 +570,25 @@ func (a *App) handleLogout(w http.ResponseWriter, r *http.Request) {
 		w.WriteHeader(http.StatusMethodNotAllowed)
 		return
 	}
+	token := requestAuthCookieToken(r)
+	if token == "" {
+		token = requestBearerToken(r)
+	}
+	if token != "" {
+		if err := a.auth.RevokeSessionToken(token); err != nil {
+			util.WriteError(w, http.StatusInternalServerError, "failed to revoke session")
+			return
+		}
+	}
 	clearAuthSessionCookie(w, r)
 	util.WriteJSON(w, http.StatusOK, map[string]any{"ok": true})
 }
 
-func (a *App) writeLoginResponse(w http.ResponseWriter, identity service.Identity, token string) {
+func (a *App) writeLoginResponse(w http.ResponseWriter, identity service.Identity) {
 	permissions := a.identityPermissions(identity)
 	payload := map[string]any{
 		"ok":                        true,
 		"version":                   version.Get(),
-		"token":                     token,
 		"role":                      identity.Role,
 		"role_id":                   identity.RoleID,
 		"role_name":                 identity.RoleName,
@@ -504,9 +603,6 @@ func (a *App) writeLoginResponse(w http.ResponseWriter, identity service.Identit
 		"menu_paths":                permissions.MenuPaths,
 		"api_permissions":           permissions.APIPermissions,
 		"menus":                     service.FilterMenuPermissions(permissions.MenuPaths),
-	}
-	if token == "" {
-		delete(payload, "token")
 	}
 	util.WriteJSON(w, http.StatusOK, payload)
 }
@@ -553,7 +649,7 @@ func (a *App) handleSettings(w http.ResponseWriter, r *http.Request) {
 	case http.MethodPost:
 		body, err := readJSONMap(r)
 		if err != nil {
-			util.WriteError(w, http.StatusBadRequest, "invalid json body")
+			writeRequestBodyError(w, err, "invalid json body")
 			return
 		}
 		updated, err := a.config.Update(body)
@@ -570,8 +666,8 @@ func (a *App) handleSettings(w http.ResponseWriter, r *http.Request) {
 
 func (a *App) handleAppMeta(w http.ResponseWriter, r *http.Request) {
 	util.WriteJSON(w, http.StatusOK, map[string]any{
-		"app_title":                   "chatgpt2api",
-		"project_name":                "chatgpt2api",
+		"app_title":                   "Prism AI Studio",
+		"project_name":                "Prism AI",
 		"login_page_image_url":        a.config.LoginPageImageURL(),
 		"login_page_image_mode":       a.config.LoginPageImageMode(),
 		"login_page_image_zoom":       a.config.LoginPageImageZoom(),
@@ -596,9 +692,10 @@ func (a *App) handleLoginPageImageSettings(w http.ResponseWriter, r *http.Reques
 		return
 	}
 	if err := r.ParseMultipartForm(maxLoginPageImageSize + (1 << 20)); err != nil {
-		util.WriteError(w, http.StatusBadRequest, "invalid multipart form")
+		writeRequestBodyError(w, err, "invalid multipart form")
 		return
 	}
+	defer r.MultipartForm.RemoveAll()
 
 	currentImageURL := a.config.LoginPageImageURL()
 	nextImageURL := strings.TrimSpace(r.FormValue("login_page_image_url"))
@@ -680,8 +777,8 @@ func readLoginPageImageFile(header *multipart.FileHeader) ([]byte, string, error
 	if len(data) > maxLoginPageImageSize {
 		return nil, "", fmt.Errorf("login page image cannot exceed 10MB")
 	}
-	if ext := strings.ToLower(filepath.Ext(header.Filename)); ext == ".svg" && bytes.Contains(bytes.ToLower(data[:min(len(data), 512)]), []byte("<svg")) {
-		return data, ".svg", nil
+	if ext := strings.ToLower(filepath.Ext(header.Filename)); ext == ".svg" || bytes.Contains(bytes.ToLower(data[:min(len(data), 512)]), []byte("<svg")) {
+		return nil, "", fmt.Errorf("SVG login page images are not allowed")
 	}
 	if _, _, err := image.DecodeConfig(bytes.NewReader(data)); err != nil {
 		return nil, "", fmt.Errorf("unsupported image file")
@@ -772,7 +869,7 @@ func (a *App) handleImages(w http.ResponseWriter, r *http.Request) {
 	case http.MethodDelete:
 		body, err := readJSONMap(r)
 		if err != nil {
-			util.WriteError(w, http.StatusBadRequest, "invalid json body")
+			writeRequestBodyError(w, err, "invalid json body")
 			return
 		}
 		result, err := a.images.DeleteImages(util.AsStringSlice(body["paths"]), service.ImageAccessScope{All: true})
@@ -797,7 +894,7 @@ func (a *App) handleImageVisibility(w http.ResponseWriter, r *http.Request) {
 	}
 	body, err := readJSONMap(r)
 	if err != nil {
-		util.WriteError(w, http.StatusBadRequest, "invalid json body")
+		writeRequestBodyError(w, err, "invalid json body")
 		return
 	}
 	path := util.Clean(body["path"])
@@ -997,7 +1094,7 @@ func (a *App) handleLogGovernance(w http.ResponseWriter, r *http.Request) {
 	case http.MethodPost:
 		body, err := readJSONMap(r)
 		if err != nil {
-			util.WriteError(w, http.StatusBadRequest, "invalid json body")
+			writeRequestBodyError(w, err, "invalid json body")
 			return
 		}
 		retentionDays := util.ToInt(body["retention_days"], a.config.LogRetentionDays())
@@ -1025,7 +1122,7 @@ func (a *App) handleImageStorageGovernance(w http.ResponseWriter, r *http.Reques
 	case http.MethodPost:
 		body, err := readJSONMap(r)
 		if err != nil {
-			util.WriteError(w, http.StatusBadRequest, "invalid json body")
+			writeRequestBodyError(w, err, "invalid json body")
 			return
 		}
 		action := strings.TrimSpace(util.Clean(body["action"]))
@@ -1092,7 +1189,11 @@ func (a *App) handleProxy(w http.ResponseWriter, r *http.Request) {
 			w.WriteHeader(http.StatusMethodNotAllowed)
 			return
 		}
-		body, _ := readJSONMap(r)
+		body, err := readJSONMap(r)
+		if err != nil {
+			writeRequestBodyError(w, err, "invalid json body")
+			return
+		}
 		candidate := strings.TrimSpace(util.Clean(body["url"]))
 		if candidate == "" {
 			candidate = a.config.Proxy()
@@ -1108,7 +1209,11 @@ func (a *App) handleProxy(w http.ResponseWriter, r *http.Request) {
 	case http.MethodGet:
 		util.WriteJSON(w, http.StatusOK, map[string]any{"proxy": map[string]any{"url": a.config.Proxy()}})
 	case http.MethodPost:
-		body, _ := readJSONMap(r)
+		body, err := readJSONMap(r)
+		if err != nil {
+			writeRequestBodyError(w, err, "invalid json body")
+			return
+		}
 		url := util.Clean(body["url"])
 		updated, err := a.config.Update(map[string]any{"proxy": url})
 		if err != nil {
@@ -1216,6 +1321,10 @@ func isPermissionCheckSkipped(path string) bool {
 		return true
 	case "/api/profile/prompt-favorites":
 		return true
+	// Per-user image conversation history is personal state for the 创作台 page.
+	// Any authenticated identity may read/sync their own document; access is scoped by owner_id.
+	case "/api/image-conversations":
+		return true
 	default:
 		return strings.HasPrefix(path, "/api/profile/api-key/") || strings.HasPrefix(path, "/api/profile/prompt-favorites/")
 	}
@@ -1284,10 +1393,20 @@ func readJSONMap(r *http.Request) (map[string]any, error) {
 	return body, err
 }
 
+func writeRequestBodyError(w http.ResponseWriter, err error, fallback string) {
+	var maxBytesErr *http.MaxBytesError
+	if errors.As(err, &maxBytesErr) {
+		util.WriteError(w, http.StatusRequestEntityTooLarge, "request body too large")
+		return
+	}
+	util.WriteError(w, http.StatusBadRequest, fallback)
+}
+
 func readMultipartImageBody(r *http.Request) (map[string]any, []protocol.UploadedImage, error) {
 	if err := r.ParseMultipartForm(128 << 20); err != nil {
 		return nil, nil, err
 	}
+	defer r.MultipartForm.RemoveAll()
 	body := map[string]any{
 		"client_task_id":           firstForm(r.MultipartForm, "client_task_id"),
 		"prompt":                   firstForm(r.MultipartForm, "prompt"),
@@ -1327,6 +1446,9 @@ func readMultipartImageBody(r *http.Request) (map[string]any, []protocol.Uploade
 	var images []protocol.UploadedImage
 	for _, field := range []string{"image", "image[]"} {
 		for _, header := range r.MultipartForm.File[field] {
+			if len(images) >= maxMultipartImageCount {
+				return nil, nil, fmt.Errorf("at most %d image files are allowed", maxMultipartImageCount)
+			}
 			image, err := readUpload(header)
 			if err != nil {
 				return nil, nil, err
@@ -1353,9 +1475,12 @@ func readUpload(header *multipart.FileHeader) (protocol.UploadedImage, error) {
 		return protocol.UploadedImage{}, err
 	}
 	defer file.Close()
-	data, err := io.ReadAll(file)
+	data, err := io.ReadAll(io.LimitReader(file, maxMultipartImageBytes+1))
 	if err != nil {
 		return protocol.UploadedImage{}, err
+	}
+	if len(data) > maxMultipartImageBytes {
+		return protocol.UploadedImage{}, fmt.Errorf("image file %s exceeds 25 MB", header.Filename)
 	}
 	contentType := header.Header.Get("Content-Type")
 	if contentType == "" {

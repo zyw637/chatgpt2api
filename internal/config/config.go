@@ -404,6 +404,12 @@ func (s *Store) ImageMetadataDir() string {
 	return path
 }
 
+func (s *Store) ExternalImageReferencesDir() string {
+	path := filepath.Join(s.DataDir, "external-image-references")
+	_ = os.MkdirAll(path, 0o755)
+	return path
+}
+
 func (s *Store) LoginPageImagesDir() string {
 	path := filepath.Join(s.DataDir, "login_page_images")
 	_ = os.MkdirAll(path, 0o755)
@@ -993,7 +999,29 @@ func writeEnvUpdates(path string, updates map[string]string) error {
 			next = append(next, formatEnvAssignment(key, pending[key]))
 		}
 	}
-	return os.WriteFile(path, []byte(strings.TrimRight(strings.Join(next, "\n"), "\n")+"\n"), 0o644)
+	data := []byte(strings.TrimRight(strings.Join(next, "\n"), "\n") + "\n")
+	temp, err := os.CreateTemp(filepath.Dir(path), ".env-*")
+	if err != nil {
+		return err
+	}
+	tempPath := temp.Name()
+	defer os.Remove(tempPath)
+	if err := temp.Chmod(0o600); err != nil {
+		_ = temp.Close()
+		return err
+	}
+	if _, err := temp.Write(data); err != nil {
+		_ = temp.Close()
+		return err
+	}
+	if err := temp.Sync(); err != nil {
+		_ = temp.Close()
+		return err
+	}
+	if err := temp.Close(); err != nil {
+		return err
+	}
+	return os.Rename(tempPath, path)
 }
 
 func formatEnvAssignment(key, value string) string {

@@ -9,13 +9,13 @@ import {
   FileText,
   Files,
   KeyRound,
-  LoaderCircle,
   ServerCog,
   Upload,
 } from "lucide-react";
 import { toast } from "sonner";
 
 import { Button } from "@/components/ui/button";
+import { ApiLoadingMark } from "@/components/api-loading-mark";
 import { Card, CardContent } from "@/components/ui/card";
 import {
   Dialog,
@@ -535,7 +535,7 @@ export function AccountImportDialog({ disabled, canImportTokens, canImportSessio
                 onClick={() => void handleImportTokenText()}
                 disabled={footerDisabled}
               >
-                {isSubmitting ? <LoaderCircle className="size-4 animate-spin" /> : null}
+                {isSubmitting ? <ApiLoadingMark size="inline" label="正在导入账户" /> : null}
                 导入 Token
               </Button>
             ) : null}
@@ -545,7 +545,7 @@ export function AccountImportDialog({ disabled, canImportTokens, canImportSessio
                 onClick={() => void handleImportSessionJson()}
                 disabled={footerDisabled}
               >
-                {isSubmitting ? <LoaderCircle className="size-4 animate-spin" /> : null}
+                {isSubmitting ? <ApiLoadingMark size="inline" label="正在导入账户" /> : null}
                 导入 JSON
               </Button>
             ) : null}
@@ -592,7 +592,7 @@ export function AccountImportDialog({ disabled, canImportTokens, canImportSessio
               onClick={() => void submitTokens(pendingCpaImport?.tokens ?? [], "CPA JSON 导入完成")}
               disabled={isSubmitting || !pendingCpaImport}
             >
-              {isSubmitting ? <LoaderCircle className="size-4 animate-spin" /> : null}
+              {isSubmitting ? <ApiLoadingMark size="inline" label="正在导入账户" /> : null}
               确认导入
             </Button>
           </DialogFooter>

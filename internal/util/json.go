@@ -177,7 +177,17 @@ func ToBool(v any) bool {
 func DecodeJSON(r io.Reader, out any) error {
 	dec := json.NewDecoder(r)
 	dec.UseNumber()
-	return dec.Decode(out)
+	if err := dec.Decode(out); err != nil {
+		return err
+	}
+	var trailing any
+	if err := dec.Decode(&trailing); err != io.EOF {
+		if err == nil {
+			return fmt.Errorf("invalid trailing JSON data")
+		}
+		return err
+	}
+	return nil
 }
 
 func WriteJSON(w http.ResponseWriter, status int, payload any) {

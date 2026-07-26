@@ -605,7 +605,7 @@ func publicLogItem(item map[string]any) map[string]any {
 		if key == "type" {
 			continue
 		}
-		out[key] = value
+		out[key] = SanitizeLogValue(value)
 	}
 	return out
 }
@@ -816,6 +816,12 @@ func SanitizeLogValue(v any) any {
 }
 
 func sanitizeLogField(key string, value any) any {
+	if strings.Contains(strings.ToLower(strings.TrimSpace(key)), "password") {
+		return "[REDACTED]"
+	}
+	if strings.EqualFold(strings.TrimSpace(key), "api_key") {
+		return "[REDACTED]"
+	}
 	if s, ok := value.(string); ok && sensitiveLogKey(key) {
 		return maskString(s, 10)
 	}
@@ -827,6 +833,9 @@ func sanitizeLogField(key string, value any) any {
 
 func sensitiveLogKey(key string) bool {
 	lower := strings.ToLower(strings.TrimSpace(key))
+	if strings.HasSuffix(lower, "_preview") {
+		return false
+	}
 	switch lower {
 	case "authorization", "password", "secret", "token", "access_token", "accesstoken", "refresh_token", "refreshtoken", "session_token", "sessiontoken", "session_json", "sessionjson", "api_key", "key", "dx":
 		return true
@@ -845,8 +854,11 @@ func base64LogKey(key string) bool {
 }
 
 func maskString(value string, keep int) string {
-	if len(value) <= keep {
+	if strings.HasSuffix(value, "...") || value == "[REDACTED]" {
 		return value
+	}
+	if len(value) <= keep {
+		return "[REDACTED]"
 	}
 	return value[:keep] + "..."
 }

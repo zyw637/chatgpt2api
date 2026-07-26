@@ -1,6 +1,7 @@
 package service
 
 import (
+	"bytes"
 	"encoding/json"
 	"errors"
 	"image"
@@ -21,6 +22,7 @@ import (
 	"time"
 
 	"chatgpt2api/internal/storage"
+	"chatgpt2api/internal/util"
 )
 
 const (
@@ -33,6 +35,9 @@ const (
 
 	ImageVisibilityPrivate = "private"
 	ImageVisibilityPublic  = "public"
+
+	ImageSourceCreation    = "creation"
+	ImageSourceExternalAPI = "external_api"
 )
 
 type ImageConfig interface {
@@ -69,6 +74,11 @@ type imageMetadata struct {
 	ReferenceImages   []imageReferenceMetadata
 	SharePromptParams bool
 	ShareReferences   bool
+	Source            string
+	ProviderID        string
+	ProviderName      string
+	Protocol          string
+	RevisedPrompt     string
 }
 
 type GeneratedImageMetadata struct {
@@ -87,6 +97,11 @@ type GeneratedImageMetadata struct {
 	ReferenceImages   []GeneratedImageReference
 	SharePromptParams bool
 	ShareReferences   bool
+	Source            string
+	ProviderID        string
+	ProviderName      string
+	Protocol          string
+	RevisedPrompt     string
 }
 
 type GeneratedImageReference struct {
@@ -604,6 +619,78 @@ func (s *ImageService) RecordGeneratedImages(values []string, ownerID, ownerName
 	}
 }
 
+func (s *ImageService) SaveGeneratedImage(data []byte, contentType, ownerID, ownerName string, metadata GeneratedImageMetadata) (map[string]any, error) {
+	if len(data) == 0 {
+		return nil, errors.New("image data is required")
+	}
+	detected := strings.TrimSpace(strings.Split(http.DetectContentType(data), ";")[0])
+	claimed := strings.TrimSpace(strings.Split(contentType, ";")[0])
+	if claimed != "" && !strings.HasPrefix(claimed, "image/") {
+		return nil, errors.New("content type is not an image")
+	}
+	extension := ""
+	outputFormat := ""
+	switch detected {
+	case "image/png":
+		extension, outputFormat = ".png", "png"
+	case "image/jpeg":
+		extension, outputFormat = ".jpg", "jpeg"
+	case "image/webp":
+		extension, outputFormat = ".webp", "webp"
+	default:
+		return nil, errors.New("unsupported image format")
+	}
+	if _, _, err := image.DecodeConfig(bytes.NewReader(data)); err != nil {
+		return nil, errors.New("invalid image data")
+	}
+	now := time.Now()
+	rel := filepath.ToSlash(filepath.Join(
+		now.Format("2006"), now.Format("01"), now.Format("02"),
+		strconv.FormatInt(now.UnixMilli(), 10)+"_"+util.NewHex(10)+extension,
+	))
+	path := filepath.Join(s.config.ImagesDir(), filepath.FromSlash(rel))
+	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
+		return nil, err
+	}
+	if err := os.WriteFile(path, data, 0o644); err != nil {
+		return nil, err
+	}
+	info, err := os.Stat(path)
+	if err != nil {
+		_ = os.Remove(path)
+		return nil, err
+	}
+	ref := imageFileRef{rel: rel, path: path, info: info}
+	if metadata.OutputFormat == "" {
+		metadata.OutputFormat = outputFormat
+	}
+	if metadata.Source == "" {
+		metadata.Source = ImageSourceCreation
+	}
+	if err := s.writeImageMetadataForRef(ref, ownerID, ownerName, ImageVisibilityPrivate, metadata); err != nil {
+		_ = os.Remove(path)
+		return nil, err
+	}
+	thumb := s.ensureThumbnailForRef(ref)
+	meta := s.imageMetadata(rel)
+	item := map[string]any{
+		"name": filepath.Base(path), "path": rel, "date": imageDay(rel, info.ModTime()),
+		"size": info.Size(), "size_bytes": info.Size(), "content_type": detected,
+		"url": publicAssetURL("", "images", rel), "created_at": info.ModTime().Format("2006-01-02 15:04:05"),
+		"visibility": meta.Visibility,
+	}
+	addImageMetadataFields(item, meta)
+	if thumbRel := toString(thumb["thumbnail_rel"]); thumbRel != "" {
+		item["thumbnail_url"] = thumbnailURL("", thumbRel, info.ModTime())
+	}
+	if !setImageItemDimensions(item, thumb["width"], thumb["height"]) {
+		if width, height, ok := imageFileDimensions(path); ok {
+			setImageItemDimensions(item, width, height)
+		}
+	}
+	return item, nil
+}
+
 func (s *ImageService) EnsureThumbnails(values []string) {
 	for _, ref := range s.imageFileRefs(values) {
 		s.ensureThumbnailForRef(ref)
@@ -839,6 +926,11 @@ func normalizeImageMetadata(raw map[string]any) imageMetadata {
 		ReferenceImages:   normalizeImageReferenceMetadata(raw["reference_images"]),
 		SharePromptParams: boolMetadataValue(raw["share_prompt_parameters"]),
 		ShareReferences:   boolMetadataValue(raw["share_reference_images"]),
+		Source:            normalizeImageSource(toString(raw["source"])),
+		ProviderID:        strings.TrimSpace(toString(raw["provider_id"])),
+		ProviderName:      strings.TrimSpace(toString(raw["provider_name"])),
+		Protocol:          strings.TrimSpace(toString(raw["protocol"])),
+		RevisedPrompt:     strings.TrimSpace(toString(raw["revised_prompt"])),
 	}
 }
 
@@ -914,6 +1006,24 @@ func (s *ImageService) writeImageMetadataForRef(ref imageFileRef, ownerID, owner
 		}
 		meta.SharePromptParams = metadata.SharePromptParams
 		meta.ShareReferences = metadata.ShareReferences
+		if strings.TrimSpace(metadata.Source) != "" {
+			meta.Source = normalizeImageSource(metadata.Source)
+		}
+		if providerID := strings.TrimSpace(metadata.ProviderID); providerID != "" {
+			meta.ProviderID = providerID
+		}
+		if providerName := strings.TrimSpace(metadata.ProviderName); providerName != "" {
+			meta.ProviderName = providerName
+		}
+		if protocol := strings.TrimSpace(metadata.Protocol); protocol != "" {
+			meta.Protocol = protocol
+		}
+		if revisedPrompt := strings.TrimSpace(metadata.RevisedPrompt); revisedPrompt != "" {
+			meta.RevisedPrompt = revisedPrompt
+		}
+	}
+	if meta.Source == "" {
+		meta.Source = ImageSourceCreation
 	}
 	if meta.Visibility == "" {
 		meta.Visibility = ImageVisibilityPrivate
@@ -980,6 +1090,19 @@ func (s *ImageService) writeImageMetadata(rel string, meta imageMetadata) error 
 	}
 	if meta.ShareReferences {
 		value["share_reference_images"] = true
+	}
+	value["source"] = normalizeImageSource(meta.Source)
+	if meta.ProviderID != "" {
+		value["provider_id"] = meta.ProviderID
+	}
+	if meta.ProviderName != "" {
+		value["provider_name"] = meta.ProviderName
+	}
+	if meta.Protocol != "" {
+		value["protocol"] = meta.Protocol
+	}
+	if meta.RevisedPrompt != "" {
+		value["revised_prompt"] = meta.RevisedPrompt
 	}
 	if len(meta.ReferenceImages) > 0 {
 		refs := make([]map[string]any, 0, len(meta.ReferenceImages))
@@ -1426,6 +1549,16 @@ func addImageMetadataFields(item map[string]any, meta imageMetadata, optionsValu
 	}
 	item["share_prompt_parameters"] = meta.SharePromptParams
 	item["share_reference_images"] = meta.ShareReferences
+	item["source"] = normalizeImageSource(meta.Source)
+	if meta.ProviderID != "" {
+		item["provider_id"] = meta.ProviderID
+	}
+	if meta.ProviderName != "" {
+		item["provider_name"] = meta.ProviderName
+	}
+	if meta.Protocol != "" {
+		item["protocol"] = meta.Protocol
+	}
 	if options.IncludeReusableFields {
 		if meta.Prompt != "" {
 			item["prompt"] = meta.Prompt
@@ -1463,6 +1596,9 @@ func addImageMetadataFields(item map[string]any, meta imageMetadata, optionsValu
 		if meta.InputImageMask != "" {
 			item["input_image_mask"] = meta.InputImageMask
 		}
+		if meta.RevisedPrompt != "" {
+			item["revised_prompt"] = meta.RevisedPrompt
+		}
 	}
 	if options.IncludeReferenceImages && len(meta.ReferenceImages) > 0 {
 		baseURL := strings.TrimSpace(options.BaseURL)
@@ -1496,6 +1632,13 @@ func addImageMetadataFields(item map[string]any, meta imageMetadata, optionsValu
 			item["reference_image_urls"] = referenceURLs
 		}
 	}
+}
+
+func normalizeImageSource(value string) string {
+	if strings.TrimSpace(value) == ImageSourceExternalAPI {
+		return ImageSourceExternalAPI
+	}
+	return ImageSourceCreation
 }
 
 func NormalizeImageVisibility(value string) (string, error) {

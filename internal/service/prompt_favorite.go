@@ -20,14 +20,15 @@ func NewPromptFavoriteService(backend ...storage.Backend) *PromptFavoriteService
 	return &PromptFavoriteService{store: firstJSONDocumentStore(backend)}
 }
 
-func (s *PromptFavoriteService) List(ownerID string) []map[string]any {
+func (s *PromptFavoriteService) List(ownerID string) ([]map[string]any, error) {
 	ownerID = util.Clean(ownerID)
 	if ownerID == "" {
-		return []map[string]any{}
+		return []map[string]any{}, nil
 	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	return copyMaps(s.loadLocked(ownerID))
+	items, err := s.loadLocked(ownerID)
+	return copyMaps(items), err
 }
 
 func (s *PromptFavoriteService) Upsert(ownerID string, body map[string]any) (map[string]any, error) {
@@ -39,7 +40,10 @@ func (s *PromptFavoriteService) Upsert(ownerID string, body map[string]any) (map
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
-	items := s.loadLocked(ownerID)
+	items, err := s.loadLocked(ownerID)
+	if err != nil {
+		return nil, err
+	}
 	now := util.NowISO()
 	existingIndex := -1
 	existingFavoritedAt := ""
@@ -68,17 +72,20 @@ func (s *PromptFavoriteService) Upsert(ownerID string, body map[string]any) (map
 	return util.CopyMap(item), nil
 }
 
-func (s *PromptFavoriteService) Delete(ownerID, id string) bool {
+func (s *PromptFavoriteService) Delete(ownerID, id string) (bool, error) {
 	ownerID = util.Clean(ownerID)
 	id = util.Clean(id)
 	if ownerID == "" || id == "" {
-		return false
+		return false, nil
 	}
 
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
-	items := s.loadLocked(ownerID)
+	items, err := s.loadLocked(ownerID)
+	if err != nil {
+		return false, err
+	}
 	next := items[:0]
 	removed := false
 	for _, item := range items {
@@ -89,15 +96,23 @@ func (s *PromptFavoriteService) Delete(ownerID, id string) bool {
 		next = append(next, item)
 	}
 	if !removed {
-		return false
+		return false, nil
 	}
-	_ = s.saveLocked(ownerID, next)
-	return true
+	if err := s.saveLocked(ownerID, next); err != nil {
+		return false, err
+	}
+	return true, nil
 }
 
-func (s *PromptFavoriteService) loadLocked(ownerID string) []map[string]any {
+func (s *PromptFavoriteService) loadLocked(ownerID string) ([]map[string]any, error) {
 	name := promptFavoriteDocumentName(ownerID)
-	raw := loadStoredJSON(s.store, name)
+	if s.store == nil {
+		return nil, fmt.Errorf("prompt favorite document backend is required")
+	}
+	raw, err := s.store.LoadJSONDocument(name)
+	if err != nil {
+		return nil, err
+	}
 	items := make([]map[string]any, 0)
 	for _, item := range util.AsMapSlice(util.StringMap(raw)["items"]) {
 		if normalized := normalizeStoredPromptFavorite(item); normalized != nil {
@@ -105,7 +120,7 @@ func (s *PromptFavoriteService) loadLocked(ownerID string) []map[string]any {
 		}
 	}
 	sortPromptFavorites(items)
-	return items
+	return items, nil
 }
 
 func (s *PromptFavoriteService) saveLocked(ownerID string, items []map[string]any) error {

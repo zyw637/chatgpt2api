@@ -7,7 +7,6 @@ import {
   Import,
   Layers,
   Link2,
-  LoaderCircle,
   Mail,
   Pencil,
   Plus,
@@ -21,6 +20,7 @@ import {
 import { toast } from "sonner";
 
 import { Badge } from "@/components/ui/badge";
+import { ApiLoadingMark } from "@/components/api-loading-mark";
 import { Button } from "@/components/ui/button";
 import { Checkbox } from "@/components/ui/checkbox";
 import {
@@ -443,7 +443,7 @@ export function Sub2APIConnections() {
         <div className="flex flex-col gap-6">
           {isLoading ? (
             <div className="flex items-center justify-center py-10">
-              <LoaderCircle className="size-5 animate-spin text-muted-foreground" />
+              <ApiLoadingMark size="section" label="正在加载 Sub2API 连接" />
             </div>
           ) : servers.length === 0 ? (
             <SettingsEmptyState
@@ -500,7 +500,7 @@ export function Sub2APIConnections() {
                           title="删除"
                         >
                           {deletingId === server.id ? (
-                            <LoaderCircle className="animate-spin" />
+                            <ApiLoadingMark size="inline" label="正在删除 Sub2API 连接" />
                           ) : (
                             <Trash2 />
                           )}
@@ -516,10 +516,7 @@ export function Sub2APIConnections() {
                         disabled={isBusy}
                       >
                         {loadingAccountsId === server.id ? (
-                          <LoaderCircle
-                            data-icon="inline-start"
-                            className="animate-spin"
-                          />
+                          <ApiLoadingMark size="inline" label="正在同步账户" />
                         ) : (
                           <Import data-icon="inline-start" />
                         )}
@@ -809,14 +806,7 @@ export function Sub2APIConnections() {
                     onClick={() => void handleFetchGroups()}
                     disabled={isLoadingGroups}
                   >
-                    {isLoadingGroups ? (
-                      <LoaderCircle
-                        data-icon="inline-start"
-                        className="animate-spin"
-                      />
-                    ) : (
-                      <RefreshCcw data-icon="inline-start" />
-                    )}
+                    <RefreshCcw data-icon="inline-start" className={isLoadingGroups ? "animate-spin" : undefined} />
                     {remoteGroups ? "重新拉取" : "拉取分组"}
                   </Button>
                 </div>
@@ -842,10 +832,7 @@ export function Sub2APIConnections() {
               disabled={isSaving}
             >
               {isSaving ? (
-                <LoaderCircle
-                  data-icon="inline-start"
-                  className="animate-spin"
-                />
+                <ApiLoadingMark size="inline" label="正在保存 Sub2API 连接" />
               ) : (
                 <Save data-icon="inline-start" />
               )}
@@ -1029,10 +1016,7 @@ export function Sub2APIConnections() {
               disabled={isStartingImport || selectedIds.length === 0}
             >
               {isStartingImport ? (
-                <LoaderCircle
-                  data-icon="inline-start"
-                  className="animate-spin"
-                />
+                <ApiLoadingMark size="inline" label="正在导入账户" />
               ) : (
                 <Import data-icon="inline-start" />
               )}

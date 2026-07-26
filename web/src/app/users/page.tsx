@@ -11,7 +11,6 @@ import {
   ChevronRight,
   Gauge,
   KeyRound,
-  LoaderCircle,
   Plus,
   RefreshCw,
   Search,
@@ -24,6 +23,7 @@ import {
 import { toast } from "sonner";
 
 import { PageHeader } from "@/components/page-header";
+import { ApiLoadingMark } from "@/components/api-loading-mark";
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
 import { Card, CardContent } from "@/components/ui/card";
@@ -1244,7 +1244,7 @@ function UsersContent() {
                             disabled={isPending}
                           >
                             {isPending ? (
-                              <LoaderCircle className="size-4 animate-spin" />
+                              <ApiLoadingMark size="inline" label="正在更新用户" />
                             ) : user.enabled ? (
                               <Ban className="size-4" />
                             ) : (
@@ -1272,7 +1272,7 @@ function UsersContent() {
           </div>
           {isLoading ? (
             <div className="flex items-center justify-center py-14">
-              <LoaderCircle className="size-5 animate-spin text-stone-400" />
+              <ApiLoadingMark size="section" label="正在加载用户" />
             </div>
           ) : null}
           {!isLoading && items.length === 0 ? <div className="px-6 py-14 text-center text-sm text-stone-500">{hasActiveFilters ? "没有匹配的用户" : "暂无用户"}</div> : null}
@@ -1439,7 +1439,7 @@ function UsersContent() {
               取消
             </Button>
             <Button type="button" className="h-10 rounded-xl px-5" onClick={() => void handleCreate()} disabled={isCreating}>
-              {isCreating ? <LoaderCircle className="size-4 animate-spin" /> : <Plus className="size-4" />}
+              {isCreating ? <ApiLoadingMark size="inline" label="正在创建用户" /> : <Plus className="size-4" />}
               创建
             </Button>
           </DialogFooter>
@@ -1656,7 +1656,7 @@ function UsersContent() {
                 || (bulkBillingForm.scope === "role" && !bulkBillingForm.roleId)
               }
             >
-              {isApplyingBulkBilling ? <LoaderCircle className="size-4 animate-spin" /> : <UsersRound className="size-4" />}
+              {isApplyingBulkBilling ? <ApiLoadingMark size="inline" label="正在应用计费设置" /> : <UsersRound className="size-4" />}
               执行批量调整
             </Button>
           </DialogFooter>
@@ -1705,7 +1705,7 @@ function UsersContent() {
               onClick={() => void handleSaveRole()}
               disabled={isSavingRole || !roleUser || !selectedRoleId}
             >
-              {isSavingRole ? <LoaderCircle className="size-4 animate-spin" /> : <ShieldCheck className="size-4" />}
+              {isSavingRole ? <ApiLoadingMark size="inline" label="正在保存角色" /> : <ShieldCheck className="size-4" />}
               保存
             </Button>
           </DialogFooter>
@@ -1811,7 +1811,7 @@ function UsersContent() {
 
               <div className="flex justify-end">
                 <Button type="button" className="h-10 rounded-xl px-5" onClick={() => void handleApplyBillingBase()} disabled={isSavingBilling}>
-                  {isSavingBilling ? <LoaderCircle className="size-4 animate-spin" /> : <Gauge className="size-4" />}
+              {isSavingBilling ? <ApiLoadingMark size="inline" label="正在保存计费设置" /> : <Gauge className="size-4" />}
                   保存计费配置
                 </Button>
               </div>
@@ -1854,7 +1854,7 @@ function UsersContent() {
               <div className="rounded-2xl border border-border p-4">
                 <div className="mb-3 flex items-center justify-between gap-3">
                   <div className="text-sm font-semibold text-foreground">最近调整记录</div>
-                  {isLoadingBilling ? <LoaderCircle className="size-4 animate-spin text-muted-foreground" /> : null}
+                  {isLoadingBilling ? <ApiLoadingMark size="inline" label="正在加载计费信息" /> : null}
                 </div>
                 <div className="max-h-56 space-y-2 overflow-y-auto overscroll-contain pr-1 [scrollbar-color:rgba(142,142,147,.45)_transparent] [scrollbar-gutter:stable] [scrollbar-width:thin] [&::-webkit-scrollbar]:w-1.5 [&::-webkit-scrollbar-thumb]:rounded-full [&::-webkit-scrollbar-thumb]:bg-[#8e8e93]/45 [&::-webkit-scrollbar-track]:bg-transparent">
                   {billingAdjustments.length === 0 ? (
@@ -1909,7 +1909,7 @@ function UsersContent() {
               onClick={() => void handleDelete()}
               disabled={deletingUser ? pendingIds.has(deletingUser.id) : false}
             >
-              {deletingUser && pendingIds.has(deletingUser.id) ? <LoaderCircle className="size-4 animate-spin" /> : <Trash2 className="size-4" />}
+              {deletingUser && pendingIds.has(deletingUser.id) ? <ApiLoadingMark size="inline" label="正在删除用户" /> : <Trash2 className="size-4" />}
               删除
             </Button>
           </DialogFooter>
@@ -1922,7 +1922,7 @@ function UsersContent() {
 export default function UsersPage() {
   const { isCheckingAuth, session } = useAuthGuard(undefined, "/users");
   if (isCheckingAuth || !session) {
-    return <div className="flex min-h-[40vh] items-center justify-center"><LoaderCircle className="size-5 animate-spin text-stone-400" /></div>;
+    return <div className="flex min-h-[40vh] items-center justify-center"><ApiLoadingMark size="page" label="正在验证登录状态" /></div>;
   }
   return <UsersContent />;
 }

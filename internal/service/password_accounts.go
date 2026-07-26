@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"regexp"
 	"strings"
+	"time"
 
 	"chatgpt2api/internal/util"
 
@@ -17,6 +18,15 @@ const (
 )
 
 var accountUsernameRE = regexp.MustCompile(`^[a-z0-9][a-z0-9_.-]{2,31}$`)
+
+var (
+	ErrInvalidPasswordCredentials = authError("用户名或密码错误")
+	ErrPasswordAccountDisabled    = authError("用户已被禁用")
+)
+
+func IsPasswordLoginFailure(err error) bool {
+	return errors.Is(err, ErrInvalidPasswordCredentials) || errors.Is(err, ErrPasswordAccountDisabled)
+}
 
 type PasswordAccount struct {
 	ID           string
@@ -100,6 +110,7 @@ func (s *AuthService) EnsureBootstrapAdmin(username, password string) (Bootstrap
 	}
 	s.accounts = append(s.accounts, account)
 	if err := s.savePasswordAccountsLocked(); err != nil {
+		s.accounts = s.accounts[:len(s.accounts)-1]
 		return BootstrapAdminResult{}, err
 	}
 	return BootstrapAdminResult{Created: true, Generated: generated, Username: username, Password: password}, nil
@@ -136,19 +147,39 @@ func (s *AuthService) RegisterPasswordUser(username, password, name string) (*Id
 		CreatedAt:    now,
 		UpdatedAt:    now,
 	}
+	previousAccounts := append([]PasswordAccount(nil), s.accounts...)
+	previousItems := copyMaps(s.items)
 	s.accounts = append(s.accounts, account)
 	item, raw := s.issuePasswordSessionLocked(account, now)
 	if err := s.savePasswordAccountsLocked(); err != nil {
+		s.accounts = previousAccounts
+		s.items = previousItems
 		s.mu.Unlock()
 		return nil, "", err
 	}
 	if err := s.saveLocked(); err != nil {
+		s.accounts = previousAccounts
+		s.items = previousItems
+		if rollbackErr := s.savePasswordAccountsLocked(); rollbackErr != nil {
+			s.mu.Unlock()
+			return nil, "", errors.Join(err, fmt.Errorf("restore password accounts: %w", rollbackErr))
+		}
 		s.mu.Unlock()
 		return nil, "", err
 	}
 	identity := identityForAuthItem(item)
+	if err := s.notifyUserCreatedLocked(account.ID); err != nil {
+		s.accounts = previousAccounts
+		s.items = previousItems
+		passwordRollbackErr := s.savePasswordAccountsLocked()
+		authRollbackErr := s.saveLocked()
+		s.mu.Unlock()
+		return nil, "", errors.Join(err,
+			wrapAuthRollbackError("restore password accounts", passwordRollbackErr),
+			wrapAuthRollbackError("restore password sessions", authRollbackErr),
+		)
+	}
 	s.mu.Unlock()
-	s.notifyUserCreated(account.ID)
 	return identity, raw, nil
 }
 
@@ -192,40 +223,56 @@ func (s *AuthService) CreatePasswordUser(username, password, name, roleID string
 		CreatedAt:    now,
 		UpdatedAt:    now,
 	}
+	previousAccounts := append([]PasswordAccount(nil), s.accounts...)
 	s.accounts = append(s.accounts, account)
 	if err := s.savePasswordAccountsLocked(); err != nil {
+		s.accounts = previousAccounts
 		s.mu.Unlock()
 		return nil, err
 	}
 	item := managedAuthUserByIDLocked(s.items, s.roles, s.accounts, account.ID)
+	if err := s.notifyUserCreatedLocked(account.ID); err != nil {
+		s.accounts = previousAccounts
+		rollbackErr := s.savePasswordAccountsLocked()
+		s.mu.Unlock()
+		return nil, errors.Join(err, wrapAuthRollbackError("restore password accounts", rollbackErr))
+	}
 	s.mu.Unlock()
-	s.notifyUserCreated(account.ID)
 	return item, nil
 }
 
 func (s *AuthService) LoginPassword(username, password string) (*Identity, string, error) {
 	username, err := normalizeAccountUsername(username)
 	if err != nil {
-		return nil, "", authError("用户名或密码错误")
+		return nil, "", ErrInvalidPasswordCredentials
 	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	index, account, ok := passwordAccountIndexByUsernameLocked(s.accounts, username)
 	if !ok || !verifyAccountPassword(password, account.PasswordHash) {
-		return nil, "", authError("用户名或密码错误")
+		return nil, "", ErrInvalidPasswordCredentials
 	}
 	if !account.Enabled {
-		return nil, "", authError("用户已被禁用")
+		return nil, "", ErrPasswordAccountDisabled
 	}
 	now := util.NowISO()
+	previousAccounts := append([]PasswordAccount(nil), s.accounts...)
+	previousItems := copyMaps(s.items)
 	account.LastLoginAt = now
 	account.UpdatedAt = now
 	s.accounts[index] = account
 	item, raw := s.issuePasswordSessionLocked(account, now)
 	if err := s.savePasswordAccountsLocked(); err != nil {
+		s.accounts = previousAccounts
+		s.items = previousItems
 		return nil, "", err
 	}
 	if err := s.saveLocked(); err != nil {
+		s.accounts = previousAccounts
+		s.items = previousItems
+		if rollbackErr := s.savePasswordAccountsLocked(); rollbackErr != nil {
+			return nil, "", errors.Join(err, fmt.Errorf("restore password accounts: %w", rollbackErr))
+		}
 		return nil, "", err
 	}
 	return identityForAuthItem(item), raw, nil
@@ -240,6 +287,8 @@ func (s *AuthService) UpdateProfileName(identity Identity, name string) (*Identi
 
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	previousAccounts := append([]PasswordAccount(nil), s.accounts...)
+	previousItems := copyMaps(s.items)
 
 	displayName := ""
 	accountFound := false
@@ -275,11 +324,20 @@ func (s *AuthService) UpdateProfileName(identity Identity, name string) (*Identi
 			}
 		}
 		if err := s.savePasswordAccountsLocked(); err != nil {
+			s.accounts = previousAccounts
+			s.items = previousItems
 			return nil, err
 		}
 	}
 	if changedItems {
 		if err := s.saveLocked(); err != nil {
+			s.accounts = previousAccounts
+			s.items = previousItems
+			if accountFound {
+				if rollbackErr := s.savePasswordAccountsLocked(); rollbackErr != nil {
+					return nil, errors.Join(err, fmt.Errorf("restore password accounts: %w", rollbackErr))
+				}
+			}
 			return nil, err
 		}
 	}
@@ -296,16 +354,16 @@ func (s *AuthService) UpdateProfileName(identity Identity, name string) (*Identi
 	return &nextIdentity, nil
 }
 
-func (s *AuthService) ChangeProfilePassword(identity Identity, currentPassword, nextPassword string) error {
+func (s *AuthService) ChangeProfilePassword(identity Identity, currentPassword, nextPassword string) (*Identity, string, error) {
 	ownerID := util.Clean(identity.OwnerID)
 	if ownerID == "" {
-		return errAuthOwnerRequired()
+		return nil, "", errAuthOwnerRequired()
 	}
 	if strings.TrimSpace(currentPassword) == "" {
-		return authError("current password is required")
+		return nil, "", authError("current password is required")
 	}
 	if err := validateAccountPassword(nextPassword); err != nil {
-		return err
+		return nil, "", err
 	}
 	now := util.NowISO()
 
@@ -316,18 +374,42 @@ func (s *AuthService) ChangeProfilePassword(identity Identity, currentPassword, 
 			continue
 		}
 		if !verifyAccountPassword(currentPassword, account.PasswordHash) {
-			return authError("当前密码错误")
+			return nil, "", authError("当前密码错误")
 		}
 		hash, err := hashAccountPassword(nextPassword)
 		if err != nil {
-			return err
+			return nil, "", err
 		}
+		previousAccounts := append([]PasswordAccount(nil), s.accounts...)
+		previousItems := copyMaps(s.items)
 		account.PasswordHash = hash
 		account.UpdatedAt = now
 		s.accounts[index] = account
-		return s.savePasswordAccountsLocked()
+		nextItems := make([]map[string]any, 0, len(s.items))
+		for _, item := range s.items {
+			if util.Clean(item["kind"]) == AuthKindSession && util.Clean(item["owner_id"]) == ownerID {
+				continue
+			}
+			nextItems = append(nextItems, item)
+		}
+		s.items = nextItems
+		item, raw := s.issuePasswordSessionLocked(account, now)
+		if err := s.savePasswordAccountsLocked(); err != nil {
+			s.accounts = previousAccounts
+			s.items = previousItems
+			return nil, "", err
+		}
+		if err := s.saveLocked(); err != nil {
+			s.accounts = previousAccounts
+			s.items = previousItems
+			if rollbackErr := s.savePasswordAccountsLocked(); rollbackErr != nil {
+				return nil, "", errors.Join(err, fmt.Errorf("restore password account: %w", rollbackErr))
+			}
+			return nil, "", err
+		}
+		return identityForAuthItem(item), raw, nil
 	}
-	return authError("password account not found")
+	return nil, "", authError("password account not found")
 }
 
 func (s *AuthService) issuePasswordSessionLocked(account PasswordAccount, now string) (map[string]any, string) {
@@ -337,32 +419,8 @@ func (s *AuthService) issuePasswordSessionLocked(account PasswordAccount, now st
 		Name:     account.DisplayName(),
 		Provider: AuthProviderLocal,
 	}
-	for index, item := range s.items {
-		if util.Clean(item["kind"]) != AuthKindSession ||
-			util.Clean(item["provider"]) != AuthProviderLocal ||
-			util.Clean(item["owner_id"]) != account.ID {
-			continue
-		}
-		next := util.CopyMap(item)
-		next["name"] = passwordSessionName
-		next["owner_name"] = account.DisplayName()
-		next["username"] = account.Username
-		next["key"] = raw
-		next["key_hash"] = util.SHA256Hex(raw)
-		next["enabled"] = account.Enabled
-		next["last_used_at"] = nil
-		next["updated_at"] = now
-		if account.Role == AuthRoleUser {
-			applyManagedRoleToAuthItem(next, roleForAccountLocked(s.roles, account))
-		} else {
-			next["role"] = AuthRoleAdmin
-			next["role_id"] = AuthRoleAdmin
-			next["role_name"] = "管理员"
-			applyPermissionSet(next, DefaultPermissionSetForRole(AuthRoleAdmin))
-		}
-		s.items[index] = next
-		return next, raw
-	}
+	nowTime, _ := time.Parse(time.RFC3339Nano, now)
+	s.items = pruneExpiredOwnerSessions(s.items, AuthProviderLocal, account.ID, nowTime)
 
 	item := newAuthItem(account.Role, AuthKindSession, passwordSessionName, owner, raw)
 	item["username"] = account.Username

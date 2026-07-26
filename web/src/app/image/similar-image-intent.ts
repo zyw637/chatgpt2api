@@ -14,6 +14,9 @@ export type SimilarImageIntent = {
   resolutionPreset?: string;
   outputFormat?: string;
   outputCompression?: number;
+  providerId?: string;
+  providerName?: string;
+  protocol?: "openai_images" | "openai_image_edits" | "openai_chat_images";
 };
 
 type SimilarImageIntentInput = Omit<SimilarImageIntent, "id" | "createdAt" | "sourceImageUrl" | "sourceImageUrls"> & {
@@ -81,6 +84,9 @@ export function consumeSimilarImageIntent(): SimilarImageIntent | null {
       resolutionPreset: typeof parsed.resolutionPreset === "string" ? parsed.resolutionPreset : undefined,
       outputFormat: typeof parsed.outputFormat === "string" ? parsed.outputFormat : undefined,
       outputCompression: typeof parsed.outputCompression === "number" ? parsed.outputCompression : undefined,
+      providerId: typeof parsed.providerId === "string" ? parsed.providerId : undefined,
+      providerName: typeof parsed.providerName === "string" ? parsed.providerName : undefined,
+      protocol: parsed.protocol === "openai_images" || parsed.protocol === "openai_image_edits" || parsed.protocol === "openai_chat_images" ? parsed.protocol : undefined,
     };
   } catch {
     return null;

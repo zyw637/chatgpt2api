@@ -3,7 +3,6 @@
 import {
   CircleHelp,
   Copy,
-  LoaderCircle,
   LogIn,
   Save,
 } from "lucide-react";
@@ -12,6 +11,7 @@ import { toast } from "sonner";
 
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
+import { ApiLoadingMark } from "@/components/api-loading-mark";
 import { Field, FieldLabel } from "@/components/ui/field";
 import { Input } from "@/components/ui/input";
 import webConfig from "@/constants/common-env";
@@ -150,7 +150,7 @@ export function LinuxDoLoginCard() {
         tone="violet"
       >
         <div className="flex items-center justify-center py-10">
-          <LoaderCircle className="size-5 animate-spin text-muted-foreground" />
+          <ApiLoadingMark size="section" label="正在加载 Linuxdo 登录配置" />
         </div>
       </SettingsCard>
     );
@@ -298,7 +298,7 @@ export function LinuxDoLoginCard() {
             disabled={isSavingConfig}
           >
             {isSavingConfig ? (
-              <LoaderCircle data-icon="inline-start" className="animate-spin" />
+              <ApiLoadingMark size="inline" label="正在保存 Linuxdo 登录配置" />
             ) : (
               <Save data-icon="inline-start" />
             )}

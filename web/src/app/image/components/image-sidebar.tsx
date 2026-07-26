@@ -1,7 +1,8 @@
 "use client";
 
-import { LoaderCircle, MessageSquarePlus, Trash2 } from "lucide-react";
+import { MessageSquarePlus, Trash2 } from "lucide-react";
 
+import { ApiLoadingMark } from "@/components/api-loading-mark";
 import { Button } from "@/components/ui/button";
 import { cn } from "@/lib/utils";
 import { getImageConversationStats, type ImageConversation } from "@/store/image-conversations";
@@ -57,7 +58,7 @@ export function ImageSidebar({
         >
           {isLoadingHistory ? (
             <div className="flex items-center gap-2 px-2 py-3 text-sm text-stone-500">
-              <LoaderCircle className="size-4 animate-spin" />
+              <ApiLoadingMark size="section" label="正在加载创作历史" />
               正在读取会话记录
             </div>
           ) : conversations.length === 0 ? (

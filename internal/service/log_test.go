@@ -159,6 +159,20 @@ func TestSanitizeLogValueMasksSessionCredentials(t *testing.T) {
 	}
 }
 
+func TestSanitizeLogValueRedactsShortPasswords(t *testing.T) {
+	sanitized := SanitizeLogValue(map[string]any{
+		"password":         "short123",
+		"current_password": "oldpass",
+		"new_password":     "newpass",
+	})
+	item := sanitized.(map[string]any)
+	for _, key := range []string{"password", "current_password", "new_password"} {
+		if item[key] != "[REDACTED]" {
+			t.Fatalf("%s = %#v, want redacted", key, item[key])
+		}
+	}
+}
+
 func TestLogServiceUserUsageStatsForUsersFiltersResults(t *testing.T) {
 	logs := NewLogService(newTestStorageBackend(t))
 

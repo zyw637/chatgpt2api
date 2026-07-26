@@ -2,7 +2,6 @@
 
 import { useEffect, useRef, useState } from "react";
 import {
-  LoaderCircle,
   PlugZap,
   Save,
   Wifi,
@@ -10,6 +9,7 @@ import {
 import { toast } from "sonner";
 
 import { Button } from "@/components/ui/button";
+import { ApiLoadingMark } from "@/components/api-loading-mark";
 import { Card, CardContent } from "@/components/ui/card";
 import { Input } from "@/components/ui/input";
 import {
@@ -120,7 +120,7 @@ export function ProxySettingsCard() {
 
         {isLoading ? (
           <div className="flex items-center justify-center py-10">
-            <LoaderCircle className="size-5 animate-spin text-stone-400" />
+            <ApiLoadingMark size="section" label="正在加载代理配置" />
           </div>
         ) : (
           <div className="space-y-4">
@@ -179,7 +179,7 @@ export function ProxySettingsCard() {
                 onClick={() => void handleSave()}
                 disabled={isSaving || !dirty}
               >
-                {isSaving ? <LoaderCircle className="size-4 animate-spin" /> : <Save className="size-4" />}
+                {isSaving ? <ApiLoadingMark size="inline" label="正在保存代理配置" /> : <Save className="size-4" />}
                 保存
               </Button>
               <Button
@@ -188,7 +188,7 @@ export function ProxySettingsCard() {
                 onClick={() => void handleTest()}
                 disabled={isTesting}
               >
-                {isTesting ? <LoaderCircle className="size-4 animate-spin" /> : <PlugZap className="size-4" />}
+                {isTesting ? <ApiLoadingMark size="inline" label="正在测试代理" /> : <PlugZap className="size-4" />}
                 测试连通
               </Button>
             </div>

@@ -1,11 +1,12 @@
 "use client";
 
 import { useState } from "react";
-import { Link2, LoaderCircle, PlugZap, Save } from "lucide-react";
+import { Link2, PlugZap, Save } from "lucide-react";
 import { toast } from "sonner";
 
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
+import { ApiLoadingMark } from "@/components/api-loading-mark";
 import { Card, CardContent } from "@/components/ui/card";
 import { Input } from "@/components/ui/input";
 import { testProxy, type ProxyTestResult } from "@/lib/api";
@@ -66,7 +67,7 @@ export function ProxySettingsCard() {
 
         {isLoadingConfig ? (
           <div className="flex items-center justify-center py-10">
-            <LoaderCircle className="size-5 animate-spin text-stone-400" />
+            <ApiLoadingMark size="section" label="正在加载代理配置" />
           </div>
         ) : (
           <>
@@ -107,7 +108,7 @@ export function ProxySettingsCard() {
                 onClick={() => void handleTest()}
                 disabled={isTesting || isLoadingConfig}
               >
-                {isTesting ? <LoaderCircle className="size-4 animate-spin" /> : <PlugZap className="size-4" />}
+                {isTesting ? <ApiLoadingMark size="inline" label="正在测试代理" /> : <PlugZap className="size-4" />}
                 测试代理
               </Button>
               <Button
@@ -115,7 +116,7 @@ export function ProxySettingsCard() {
                 onClick={() => void saveConfig()}
                 disabled={isSavingConfig}
               >
-                {isSavingConfig ? <LoaderCircle className="size-4 animate-spin" /> : <Save className="size-4" />}
+                {isSavingConfig ? <ApiLoadingMark size="inline" label="正在保存代理配置" /> : <Save className="size-4" />}
                 保存配置
               </Button>
             </div>

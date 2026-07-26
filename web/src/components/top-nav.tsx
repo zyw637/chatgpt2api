@@ -22,6 +22,7 @@ import {
 import { Button } from "@/components/ui/button";
 import { Popover, PopoverContent, PopoverTrigger } from "@/components/ui/popover";
 import { fetchAccounts, logout, type Account, type BillingState } from "@/lib/api";
+import { DEFAULT_APP_TITLE } from "@/lib/app-meta";
 import { cn } from "@/lib/utils";
 import {
   applyColorTheme,
@@ -32,8 +33,10 @@ import {
 
 const navItems = [
   { href: "/image", label: "创作台" },
+  { href: "/external-chat", label: "API 聊天" },
+  { href: "/external-image", label: "API 生图" },
+  { href: "/external-image/providers", label: "API 渠道管理" },
   { href: "/accounts", label: "号池管理" },
-  { href: "/register", label: "注册机" },
   { href: "/image-manager", label: "图片库" },
   { href: "/users", label: "用户管理" },
   { href: "/rbac", label: "角色权限" },
@@ -103,6 +106,9 @@ type NavItem = {
 };
 
 function isActivePath(pathname: string, href: string) {
+  if (href === "/external-image") {
+    return pathname === href;
+  }
   return pathname === href || pathname.startsWith(`${href}/`);
 }
 
@@ -165,7 +171,7 @@ function AccountMenu({
           type="button"
           variant="outline"
           className={cn(
-            "h-9 rounded-full px-2.5 shadow-none",
+            "size-9 rounded-full px-0 shadow-none sm:h-9 sm:w-auto sm:px-2.5",
             profileActive ? "border-[#1456f0]/30 bg-[#edf4ff] text-[#1456f0] dark:bg-sky-950/30 dark:text-sky-300" : "",
           )}
           aria-label="账号菜单"
@@ -174,7 +180,7 @@ function AccountMenu({
             {initial}
           </span>
           <span className="hidden max-w-[120px] truncate lg:inline">{displayName}</span>
-          <ChevronDown />
+          <ChevronDown className="hidden sm:block" />
         </Button>
       </PopoverTrigger>
       <PopoverContent
@@ -271,6 +277,12 @@ export function TopNav() {
   const [theme, setTheme] = useState<ColorTheme>(() => getPreferredColorTheme());
   const [availableQuota, setAvailableQuota] = useState("--");
   const [navCollapsed, setNavCollapsed] = useState(false);
+
+  useEffect(() => {
+    if (window.matchMedia("(max-width: 639px)").matches) {
+      setNavCollapsed(pathname === "/external-chat");
+    }
+  }, [pathname]);
 
   useEffect(() => {
     let active = true;
@@ -382,14 +394,14 @@ export function TopNav() {
   const navToggleLabel = navCollapsed ? "展开导航栏" : "收起导航栏";
 
   return (
-    <header className="sticky top-3 z-40 rounded-[24px] border border-border bg-card/90 shadow-[0_0_22.576px_rgba(44,74,116,0.09)] backdrop-blur dark:border-border dark:bg-card/92">
+    <header className="sticky top-3 z-40 shrink-0 rounded-[24px] border border-border bg-card/90 shadow-[0_0_22.576px_rgba(44,74,116,0.09)] backdrop-blur dark:border-border dark:bg-card/92">
       <div className="flex min-h-14 flex-col gap-2 px-3 py-2 lg:flex-row lg:items-center lg:justify-between lg:gap-4 lg:px-4">
         <div className="flex min-w-0 items-center justify-between gap-2 lg:justify-start">
           <Button
             type="button"
             variant="ghost"
             className={cn(
-              "font-display h-9 max-w-[190px] justify-start rounded-full px-1.5 pr-2 text-[15px] font-semibold text-[#18181b] shadow-none hover:bg-black/[0.04] hover:text-[#1456f0] sm:max-w-none dark:text-foreground dark:hover:text-sky-300",
+              "font-display h-9 w-0 min-w-0 flex-1 justify-start rounded-full px-1.5 pr-2 text-[15px] font-semibold text-[#18181b] shadow-none hover:bg-black/[0.04] hover:text-[#1456f0] sm:w-auto sm:max-w-none sm:flex-none dark:text-foreground dark:hover:text-sky-300",
               navCollapsed ? "bg-black/[0.04] text-[#1456f0] dark:bg-accent dark:text-sky-300" : "",
             )}
             aria-controls={PRIMARY_NAV_ID}
@@ -399,12 +411,12 @@ export function TopNav() {
             onClick={() => setNavCollapsed((collapsed) => !collapsed)}
           >
             <img
-              src="/logo-mark.svg"
+              src="/pwa-icon-192.png?v=20260719-3"
               alt=""
               aria-hidden="true"
               className="size-7 rounded-[10px] shadow-[0_4px_10px_rgba(184,90,127,0.16)]"
             />
-            <span className="truncate">chatgpt2api</span>
+            <span className="truncate">{DEFAULT_APP_TITLE}</span>
             {navCollapsed ? <ChevronDown aria-hidden="true" /> : <ChevronUp aria-hidden="true" />}
           </Button>
           <div className="ml-auto flex shrink-0 items-center gap-1 lg:hidden">
@@ -424,13 +436,15 @@ export function TopNav() {
           id={PRIMARY_NAV_ID}
           aria-label="主导航"
           className={cn(
-            "hide-scrollbar -mx-1 min-w-0 gap-1 overflow-x-auto overscroll-x-contain px-1 pb-0.5 scroll-px-1 touch-pan-x [-webkit-overflow-scrolling:touch] lg:mx-0 lg:flex-1 lg:justify-center lg:gap-1.5 lg:px-0 lg:pb-0",
-            navCollapsed ? "hidden" : "flex",
+            "hide-scrollbar -mx-1 min-w-0 overflow-x-auto overscroll-x-contain px-1 pb-0.5 scroll-px-1 touch-pan-x [-webkit-overflow-scrolling:touch] lg:mx-0 lg:flex-1 lg:px-0 lg:pb-0",
+            navCollapsed ? "hidden" : "block",
           )}
         >
-          {visibleNavItems.map((item) => (
-            <NavPill key={item.href} item={item} pathname={pathname} />
-          ))}
+          <div className="flex w-max min-w-full gap-1 lg:gap-1.5">
+            {visibleNavItems.map((item) => (
+              <NavPill key={item.href} item={item} pathname={pathname} />
+            ))}
+          </div>
         </nav>
         <div className="hidden items-center justify-end gap-1.5 lg:flex">
           {canAccessImageTasks ? <ImageTaskQueue /> : null}

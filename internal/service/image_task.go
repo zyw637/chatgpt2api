@@ -2,6 +2,7 @@ package service
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"sort"
 	"strings"
@@ -28,6 +29,8 @@ const (
 	imageTaskBillingChargeKey          = "billing_charge_key"
 )
 
+var ErrImageTaskPersistence = errors.New("image task persistence failed")
+
 type ImageTaskHandler func(context.Context, Identity, map[string]any) (map[string]any, error)
 
 type ImageOutputOptions struct {
@@ -51,6 +54,7 @@ type ImageTaskService struct {
 	edit                ImageTaskHandler
 	chat                ImageTaskHandler
 	billing             *BillingService
+	logger              *Logger
 	retentionGetter     func() int
 	taskTimeoutGetter   func() time.Duration
 	userConcurrentLimit func() int
@@ -60,6 +64,9 @@ type ImageTaskService struct {
 	ownerSubmitTimes    map[string][]time.Time
 	ownerRunningUnits   map[string]int
 	creationUnitCond    *sync.Cond
+	workers             sync.WaitGroup
+	closed              bool
+	initErr             error
 }
 
 type ImageTaskLimitError struct {
@@ -84,13 +91,19 @@ func newImageTaskService(store storage.JSONDocumentBackend, generation ImageTask
 		s.userRPMLimit = limitGetters[1]
 	}
 	s.mu.Lock()
-	s.tasks = s.loadLocked()
-	changed := s.recoverUnfinishedLocked()
-	if s.cleanupLocked() || changed {
-		_ = s.saveLocked()
+	s.tasks, s.initErr = s.loadLocked()
+	if s.initErr == nil {
+		changed := s.recoverUnfinishedLocked()
+		if s.cleanupLocked() || changed {
+			s.initErr = s.saveLocked()
+		}
 	}
 	s.mu.Unlock()
 	return s
+}
+
+func (s *ImageTaskService) InitializationError() error {
+	return s.initErr
 }
 
 func (s *ImageTaskService) SetTaskTimeoutGetter(getter func() time.Duration) {
@@ -107,6 +120,7 @@ func (s *ImageTaskService) SetBillingService(billing *BillingService) {
 	}
 	var settleKeys []string
 	s.mu.Lock()
+	previousTasks := cloneImageTaskMap(s.tasks)
 	changed := false
 	for key, task := range s.tasks {
 		taskChanged := false
@@ -125,12 +139,19 @@ func (s *ImageTaskService) SetBillingService(billing *BillingService) {
 		}
 	}
 	if changed {
-		_ = s.saveLocked()
+		if err := s.saveLocked(); err != nil {
+			s.tasks = previousTasks
+			s.logPersistenceError("recover image task billing", err, "")
+		}
 	}
 	s.mu.Unlock()
 	for _, key := range settleKeys {
 		s.settleTaskBilling(key)
 	}
+}
+
+func (s *ImageTaskService) SetLogger(logger *Logger) {
+	s.logger = logger
 }
 
 func (s *ImageTaskService) SubmitGeneration(ctx context.Context, identity Identity, clientTaskID, prompt, model, size, quality, baseURL string, n int, messages any, visibilityValues ...string) (map[string]any, error) {
@@ -235,8 +256,12 @@ func (s *ImageTaskService) ListTasks(identity Identity, taskIDs []string) map[st
 		}
 	}
 	s.mu.Lock()
+	previousTasks := cloneImageTaskMap(s.tasks)
 	if s.cleanupLocked() {
-		_ = s.saveLocked()
+		if err := s.saveLocked(); err != nil {
+			s.tasks = previousTasks
+			s.logPersistenceError("cleanup image tasks", err, "")
+		}
 	}
 	items := make([]map[string]any, 0)
 	missing := make([]string, 0)
@@ -277,6 +302,7 @@ func (s *ImageTaskService) CancelTask(identity Identity, clientTaskID string) (m
 		return nil, fmt.Errorf("creation task not found")
 	}
 	if isActiveTaskStatus(util.Clean(task["status"])) {
+		previous := util.CopyMap(task)
 		task["status"] = TaskStatusCancelled
 		task["error"] = "任务已终止"
 		if task["data"] == nil {
@@ -285,7 +311,15 @@ func (s *ImageTaskService) CancelTask(identity Identity, clientTaskID string) (m
 		task["updated_at"] = now
 		cancel = s.cancels[key]
 		delete(s.cancels, key)
-		_ = s.saveLocked()
+		if err := s.saveLocked(); err != nil {
+			s.tasks[key] = previous
+			if cancel != nil {
+				s.cancels[key] = cancel
+			}
+			s.logPersistenceError("cancel image task", err, key)
+			s.mu.Unlock()
+			return nil, fmt.Errorf("%w: %v", ErrImageTaskPersistence, err)
+		}
 		cancelled = true
 	}
 	result := publicTask(task)
@@ -299,6 +333,47 @@ func (s *ImageTaskService) CancelTask(identity Identity, clientTaskID string) (m
 	return result, nil
 }
 
+func (s *ImageTaskService) Close() {
+	s.CloseWithTimeout(0)
+}
+
+func (s *ImageTaskService) CloseWithTimeout(timeout time.Duration) bool {
+	s.mu.Lock()
+	if !s.closed {
+		s.closed = true
+		cancels := make([]context.CancelFunc, 0, len(s.cancels))
+		for _, cancel := range s.cancels {
+			cancels = append(cancels, cancel)
+		}
+		s.creationUnitCond.Broadcast()
+		s.mu.Unlock()
+		for _, cancel := range cancels {
+			cancel()
+		}
+	} else {
+		s.mu.Unlock()
+	}
+	return waitForServiceWorkers(&s.workers, timeout)
+}
+
+func waitForServiceWorkers(workers *sync.WaitGroup, timeout time.Duration) bool {
+	if timeout <= 0 {
+		workers.Wait()
+		return true
+	}
+	done := make(chan struct{})
+	go func() {
+		workers.Wait()
+		close(done)
+	}()
+	select {
+	case <-done:
+		return true
+	case <-time.After(timeout):
+		return false
+	}
+}
+
 func (s *ImageTaskService) submit(ctx context.Context, identity Identity, clientTaskID, mode string, payload map[string]any) (map[string]any, error) {
 	taskID := strings.TrimSpace(clientTaskID)
 	if taskID == "" {
@@ -308,10 +383,19 @@ func (s *ImageTaskService) submit(ctx context.Context, identity Identity, client
 	key := taskKey(owner, taskID)
 	now := util.NowLocal()
 	s.mu.Lock()
+	if s.closed {
+		s.mu.Unlock()
+		return nil, fmt.Errorf("image task service is closed")
+	}
+	previousTasks := cloneImageTaskMap(s.tasks)
+	previousSubmitTimes := cloneOwnerSubmitTimes(s.ownerSubmitTimes)
 	cleaned := s.cleanupLocked()
 	if existing := s.tasks[key]; existing != nil {
 		if cleaned {
-			_ = s.saveLocked()
+			if err := s.saveLocked(); err != nil {
+				s.tasks = previousTasks
+				s.logPersistenceError("cleanup image tasks", err, key)
+			}
 		}
 		result := publicTask(existing)
 		s.mu.Unlock()
@@ -323,7 +407,10 @@ func (s *ImageTaskService) submit(ctx context.Context, identity Identity, client
 	if shouldPrechargeBilling {
 		if err := s.billing.CheckAvailable(identity, count); err != nil {
 			if cleaned {
-				_ = s.saveLocked()
+				if saveErr := s.saveLocked(); saveErr != nil {
+					s.tasks = previousTasks
+					s.logPersistenceError("cleanup image tasks", saveErr, key)
+				}
 			}
 			s.mu.Unlock()
 			return nil, err
@@ -331,7 +418,10 @@ func (s *ImageTaskService) submit(ctx context.Context, identity Identity, client
 	}
 	if err := s.checkUserTaskLimitsLocked(identity, owner, count, time.Now()); err != nil {
 		if cleaned {
-			_ = s.saveLocked()
+			if saveErr := s.saveLocked(); saveErr != nil {
+				s.tasks = previousTasks
+				s.logPersistenceError("cleanup image tasks", saveErr, key)
+			}
 		}
 		s.mu.Unlock()
 		return nil, err
@@ -340,14 +430,6 @@ func (s *ImageTaskService) submit(ctx context.Context, identity Identity, client
 	billingChargeKey := ""
 	if shouldPrechargeBilling {
 		billingChargeKey = imageTaskBillingChargeKeyFor(owner, taskID, "precharge")
-		model := firstNonEmpty(util.Clean(payload["model"]), util.ImageModelAuto)
-		if _, err := s.billing.ChargeUserID(billingUser, count, imageTaskBillingReference(mode, taskID, model, billingChargeKey)); err != nil {
-			if cleaned {
-				_ = s.saveLocked()
-			}
-			s.mu.Unlock()
-			return nil, err
-		}
 		billingChargedAmount = count
 	}
 	taskCtx, cancel := context.WithCancel(context.Background())
@@ -371,10 +453,45 @@ func (s *ImageTaskService) submit(ctx context.Context, identity Identity, client
 	mergePublicImageToolTaskFields(task, payload)
 	s.tasks[key] = task
 	s.cancels[key] = cancel
-	_ = s.saveLocked()
+	if err := s.saveLocked(); err != nil {
+		s.tasks = previousTasks
+		s.ownerSubmitTimes = previousSubmitTimes
+		delete(s.cancels, key)
+		s.logPersistenceError("create image task", err, key)
+		persistErr := fmt.Errorf("%w: %v", ErrImageTaskPersistence, err)
+		cancel()
+		s.mu.Unlock()
+		return nil, persistErr
+	}
+	if shouldPrechargeBilling {
+		model := firstNonEmpty(util.Clean(payload["model"]), util.ImageModelAuto)
+		if _, err := s.billing.ChargeUserID(billingUser, count, imageTaskBillingReference(mode, taskID, model, billingChargeKey)); err != nil {
+			task["status"] = TaskStatusError
+			task["error"] = err.Error()
+			task["updated_at"] = util.NowLocal()
+			delete(task, imageTaskBillingChargedAmountKey)
+			delete(task, imageTaskBillingChargeKey)
+			task["billing_consumed_amount"] = 0
+			delete(s.tasks, key)
+			s.ownerSubmitTimes = previousSubmitTimes
+			delete(s.cancels, key)
+			cancel()
+			if saveErr := s.saveLocked(); saveErr != nil {
+				s.tasks[key] = task
+				s.logPersistenceError("record image task billing failure", saveErr, key)
+				err = errors.Join(err, fmt.Errorf("%w: %v", ErrImageTaskPersistence, saveErr))
+			}
+			s.mu.Unlock()
+			return nil, err
+		}
+	}
 	result := publicTask(task)
+	s.workers.Add(1)
 	s.mu.Unlock()
-	go s.runTask(taskCtx, key, mode, identity, payload)
+	go func() {
+		defer s.workers.Done()
+		s.runTask(taskCtx, key, mode, identity, payload)
+	}()
 	return result, nil
 }
 
@@ -389,6 +506,15 @@ func (s *ImageTaskService) runTask(ctx context.Context, key, mode string, identi
 	} else if mode == "chat" {
 		handler = s.chat
 	}
+
+	// Mark the task running as soon as a worker starts. Waiting until an
+	// output slot is acquired left generate/edit tasks stuck on "queued"
+	// during bootstrap/upstream work, so the UI oscillated between
+	// "processing" and "queued" even though work was already underway.
+	if !s.ensureTaskRunning(key) {
+		return
+	}
+
 	if mode == "generate" || mode == "edit" {
 		payload[imageOutputCallbackPayloadKey] = func(data []map[string]any) {
 			if len(data) == 0 {
@@ -422,7 +548,9 @@ func (s *ImageTaskService) runTask(ctx context.Context, key, mode string, identi
 			} else if runCtx.Err() == context.DeadlineExceeded {
 				message = "图片生成超时，请稍后重试或降低分辨率"
 			}
-			s.updateActiveTask(key, map[string]any{"status": status, "error": message, "data": []any{}})
+			if s.updateActiveTask(key, map[string]any{"status": status, "error": message, "data": []any{}}) {
+				s.settleTaskBilling(key)
+			}
 			return
 		}
 		if !s.ensureTaskRunning(key) {
@@ -457,8 +585,9 @@ func (s *ImageTaskService) runTask(ctx context.Context, key, mode string, identi
 		if mode == "generate" || mode == "edit" {
 			updates["output_statuses"] = finalImageOutputStatuses(taskCount(mode, payload), data, status)
 		}
-		s.updateActiveTask(key, updates)
-		s.settleTaskBilling(key)
+		if s.updateActiveTask(key, updates) {
+			s.settleTaskBilling(key)
+		}
 		return
 	}
 	data := util.AsMapSlice(result["data"])
@@ -474,8 +603,9 @@ func (s *ImageTaskService) runTask(ctx context.Context, key, mode string, identi
 		if outputType != "" {
 			updates["output_type"] = outputType
 		}
-		s.updateActiveTask(key, updates)
-		s.settleTaskBilling(key)
+		if s.updateActiveTask(key, updates) {
+			s.settleTaskBilling(key)
+		}
 		return
 	}
 	updates := map[string]any{"status": TaskStatusSuccess, "data": data, "error": ""}
@@ -485,8 +615,9 @@ func (s *ImageTaskService) runTask(ctx context.Context, key, mode string, identi
 	if outputType != "" {
 		updates["output_type"] = outputType
 	}
-	s.updateActiveTask(key, updates)
-	s.settleTaskBilling(key)
+	if s.updateActiveTask(key, updates) {
+		s.settleTaskBilling(key)
+	}
 }
 
 func finalImageOutputStatuses(count int, data []map[string]any, status string) []string {
@@ -567,6 +698,9 @@ func (s *ImageTaskService) AcquireCreationUnit(ctx context.Context, identity Ide
 		if err := ctx.Err(); err != nil {
 			return nil, err
 		}
+		if s.closed {
+			return nil, context.Canceled
+		}
 		limit := s.userConcurrentLimitValue()
 		if limit <= 0 || s.ownerRunningUnits[owner] < limit {
 			s.ownerRunningUnits[owner]++
@@ -612,10 +746,15 @@ func (s *ImageTaskService) ensureTaskRunning(key string) bool {
 	if status != TaskStatusQueued {
 		return false
 	}
+	previous := util.CopyMap(task)
 	task["status"] = TaskStatusRunning
 	task["error"] = ""
 	task["updated_at"] = util.NowLocal()
-	_ = s.saveLocked()
+	if err := s.saveLocked(); err != nil {
+		s.tasks[key] = previous
+		s.logPersistenceError("start image task", err, key)
+		return false
+	}
 	return true
 }
 
@@ -640,10 +779,15 @@ func (s *ImageTaskService) markImageOutputStatus(key string, index int, status s
 	if statuses[index-1] == "success" {
 		return true
 	}
+	previous := util.CopyMap(task)
 	statuses[index-1] = status
 	task["output_statuses"] = statuses
 	task["updated_at"] = util.NowLocal()
-	_ = s.saveLocked()
+	if err := s.saveLocked(); err != nil {
+		s.tasks[key] = previous
+		s.logPersistenceError("update image output status", err, key)
+		return false
+	}
 	return true
 }
 
@@ -668,11 +812,16 @@ func (s *ImageTaskService) updateActiveTask(key string, updates map[string]any) 
 	if !isActiveTaskStatus(util.Clean(task["status"])) {
 		return false
 	}
+	previous := util.CopyMap(task)
 	for k, v := range updates {
 		task[k] = v
 	}
 	task["updated_at"] = util.NowLocal()
-	_ = s.saveLocked()
+	if err := s.saveLocked(); err != nil {
+		s.tasks[key] = previous
+		s.logPersistenceError("finish image task", err, key)
+		return false
+	}
 	return true
 }
 
@@ -683,6 +832,7 @@ func (s *ImageTaskService) updateImageTaskPartialData(key string, data []map[str
 	if task == nil || !isActiveTaskStatus(util.Clean(task["status"])) {
 		return false
 	}
+	previous := util.CopyMap(task)
 	count := storedImageOutputCount(task)
 	statuses := normalizedImageOutputStatuses(util.Clean(task["mode"]), count, task["output_statuses"])
 	for index, item := range data {
@@ -698,7 +848,11 @@ func (s *ImageTaskService) updateImageTaskPartialData(key string, data []map[str
 		task["output_statuses"] = statuses
 	}
 	task["updated_at"] = util.NowLocal()
-	_ = s.saveLocked()
+	if err := s.saveLocked(); err != nil {
+		s.tasks[key] = previous
+		s.logPersistenceError("persist partial image task output", err, key)
+		return false
+	}
 	return true
 }
 
@@ -778,11 +932,37 @@ func (s *ImageTaskService) finishTaskBillingSettlement(key string, consumed int)
 	if task == nil || util.ToInt(task["billing_consumed_amount"], -1) >= 0 {
 		return
 	}
+	previous := util.CopyMap(task)
 	delete(task, imageTaskBillingChargedAmountKey)
 	delete(task, imageTaskBillingChargeKey)
 	task["billing_consumed_amount"] = max(0, consumed)
 	task["updated_at"] = util.NowLocal()
-	_ = s.saveLocked()
+	if err := s.saveLocked(); err != nil {
+		s.tasks[key] = previous
+		s.logPersistenceError("settle image task billing", err, key)
+	}
+}
+
+func (s *ImageTaskService) logPersistenceError(operation string, err error, key string) {
+	if err != nil && s.logger != nil {
+		s.logger.Error(operation+" failed", "error", err, "task_key", key)
+	}
+}
+
+func cloneImageTaskMap(tasks map[string]map[string]any) map[string]map[string]any {
+	out := make(map[string]map[string]any, len(tasks))
+	for key, task := range tasks {
+		out[key] = util.CopyMap(task)
+	}
+	return out
+}
+
+func cloneOwnerSubmitTimes(values map[string][]time.Time) map[string][]time.Time {
+	out := make(map[string][]time.Time, len(values))
+	for owner, times := range values {
+		out[owner] = append([]time.Time(nil), times...)
+	}
+	return out
 }
 
 func (s *ImageTaskService) removeTaskCancel(key string) {
@@ -791,8 +971,14 @@ func (s *ImageTaskService) removeTaskCancel(key string) {
 	delete(s.cancels, key)
 }
 
-func (s *ImageTaskService) loadLocked() map[string]map[string]any {
-	raw := loadStoredJSON(s.store, s.docName)
+func (s *ImageTaskService) loadLocked() (map[string]map[string]any, error) {
+	if s.store == nil {
+		return nil, fmt.Errorf("storage document backend is required")
+	}
+	raw, err := s.store.LoadJSONDocument(s.docName)
+	if err != nil {
+		return nil, err
+	}
 	if obj, ok := raw.(map[string]any); ok {
 		raw = obj["tasks"]
 	}
@@ -852,7 +1038,7 @@ func (s *ImageTaskService) loadLocked() map[string]map[string]any {
 		}
 		tasks[taskKey(owner, id)] = normalized
 	}
-	return tasks
+	return tasks, nil
 }
 
 func (s *ImageTaskService) saveLocked() error {

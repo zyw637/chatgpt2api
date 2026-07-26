@@ -13,6 +13,13 @@ func jsonDocumentStoreFromBackend(backend storage.Backend) storage.JSONDocumentB
 	return nil
 }
 
+func externalImageTaskStoreFromBackend(backend storage.Backend) storage.ExternalImageTaskBackend {
+	if store, ok := backend.(storage.ExternalImageTaskBackend); ok {
+		return store
+	}
+	return nil
+}
+
 func firstJSONDocumentStore(backends []storage.Backend) storage.JSONDocumentBackend {
 	if len(backends) == 0 {
 		return nil

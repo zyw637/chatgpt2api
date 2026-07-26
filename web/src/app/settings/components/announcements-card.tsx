@@ -3,7 +3,6 @@
 import { useEffect, useRef, useState } from "react";
 import {
   Edit3,
-  LoaderCircle,
   Megaphone,
   Plus,
   Save,
@@ -12,6 +11,7 @@ import {
 import { toast } from "sonner";
 
 import { AnnouncementMarkdown } from "@/components/announcement-markdown";
+import { ApiLoadingMark } from "@/components/api-loading-mark";
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
 import { Checkbox } from "@/components/ui/checkbox";
@@ -232,7 +232,7 @@ export function AnnouncementsCard() {
         <div className="flex flex-col gap-6">
           {isLoading ? (
             <div className="flex items-center justify-center py-10">
-              <LoaderCircle className="size-5 animate-spin text-muted-foreground" />
+              <ApiLoadingMark size="section" label="正在加载公告" />
             </div>
           ) : items.length === 0 ? (
             <SettingsEmptyState
@@ -282,10 +282,7 @@ export function AnnouncementsCard() {
                         disabled={isPending}
                       >
                         {isPending ? (
-                          <LoaderCircle
-                            data-icon="inline-start"
-                            className="animate-spin"
-                          />
+                          <ApiLoadingMark size="inline" label="正在更新公告状态" />
                         ) : null}
                         {item.enabled ? "停用" : "启用"}
                       </Button>
@@ -398,10 +395,7 @@ export function AnnouncementsCard() {
               disabled={isSaving}
             >
               {isSaving ? (
-                <LoaderCircle
-                  data-icon="inline-start"
-                  className="animate-spin"
-                />
+                <ApiLoadingMark size="inline" label="正在保存公告" />
               ) : (
                 <Save data-icon="inline-start" />
               )}
@@ -441,10 +435,7 @@ export function AnnouncementsCard() {
               disabled={deletingItem ? pendingIds.has(deletingItem.id) : false}
             >
               {deletingItem && pendingIds.has(deletingItem.id) ? (
-                <LoaderCircle
-                  data-icon="inline-start"
-                  className="animate-spin"
-                />
+                <ApiLoadingMark size="inline" label="正在删除公告" />
               ) : (
                 <Trash2 data-icon="inline-start" />
               )}

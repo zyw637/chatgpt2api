@@ -31,26 +31,33 @@ func NewProxyService(config ProxyConfig) *ProxyService {
 	return &ProxyService{config: config}
 }
 
+func (s *ProxyService) ProxyURL() string {
+	if s == nil || s.config == nil {
+		return ""
+	}
+	return strings.TrimSpace(s.config.Proxy())
+}
+
 func HTTPClientForProxy(proxy string, timeout time.Duration) *http.Client {
 	return &http.Client{Timeout: timeout, Transport: transportForProxy(proxy)}
 }
 
 func (s *ProxyService) HTTPClient(timeout time.Duration) *http.Client {
-	return HTTPClientForProxy(s.config.Proxy(), timeout)
+	return HTTPClientForProxy(s.ProxyURL(), timeout)
 }
 
 func (s *ProxyService) BrowserHTTPClient(timeout time.Duration) *http.Client {
-	return browserHTTPClient(s.config.Proxy(), timeout)
+	return browserHTTPClient(s.ProxyURL(), timeout)
 }
 
 func (s *ProxyService) BrowserHTTPClientWithProfile(profile string, timeout time.Duration) *http.Client {
-	return browserHTTPClientForProfile(s.config.Proxy(), profile, timeout)
+	return browserHTTPClientForProfile(s.ProxyURL(), profile, timeout)
 }
 
 func (s *ProxyService) Test(candidate string, timeout time.Duration) map[string]any {
 	candidate = strings.TrimSpace(candidate)
 	if candidate == "" {
-		candidate = s.config.Proxy()
+		candidate = s.ProxyURL()
 	}
 	candidate = strings.TrimSpace(candidate)
 	if candidate == "" {
@@ -60,11 +67,23 @@ func (s *ProxyService) Test(candidate string, timeout time.Duration) map[string]
 	if err != nil || parsed.Host == "" || (parsed.Scheme != "http" && parsed.Scheme != "https" && parsed.Scheme != "socks5" && parsed.Scheme != "socks5h") {
 		return map[string]any{"ok": false, "status": 0, "latency_ms": 0, "error": "invalid proxy url"}
 	}
-	client := browserHTTPClientForProfile(candidate, "", timeout)
+	// Use the same browser profile/UA as real upstream traffic so the proxy
+	// health check is not rejected solely for a synthetic user-agent.
+	client := browserHTTPClientForProfile(candidate, "chrome110", timeout)
 	ctx, cancel := context.WithTimeout(context.Background(), timeout)
 	defer cancel()
 	req, _ := http.NewRequestWithContext(ctx, http.MethodGet, "https://chatgpt.com/", nil)
-	req.Header.Set("user-agent", "Mozilla/5.0 (chatgpt2api proxy test)")
+	req.Header.Set("User-Agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/143.0.0.0 Safari/537.36 Edg/143.0.0.0")
+	req.Header.Set("Accept", "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8")
+	req.Header.Set("Accept-Language", "zh-CN,zh;q=0.9,en;q=0.8")
+	req.Header.Set("Sec-Ch-Ua", `"Microsoft Edge";v="143", "Chromium";v="143", "Not A(Brand";v="24"`)
+	req.Header.Set("Sec-Ch-Ua-Mobile", "?0")
+	req.Header.Set("Sec-Ch-Ua-Platform", `"Windows"`)
+	req.Header.Set("Sec-Fetch-Dest", "document")
+	req.Header.Set("Sec-Fetch-Mode", "navigate")
+	req.Header.Set("Sec-Fetch-Site", "none")
+	req.Header.Set("Sec-Fetch-User", "?1")
+	req.Header.Set("Upgrade-Insecure-Requests", "1")
 	start := time.Now()
 	resp, err := client.Do(req)
 	latency := time.Since(start).Milliseconds()
@@ -76,12 +95,29 @@ func (s *ProxyService) Test(candidate string, timeout time.Duration) map[string]
 		return map[string]any{"ok": false, "status": 0, "latency_ms": latency, "error": message}
 	}
 	defer resp.Body.Close()
-	ok := resp.StatusCode < 500
+	body, _ := io.ReadAll(io.LimitReader(resp.Body, 64*1024))
+	ok := resp.StatusCode >= 200 && resp.StatusCode < 400
 	var message any
 	if !ok {
 		message = resp.Status
+		if isLikelyCloudflareChallenge(resp.StatusCode, body) {
+			message = "cloudflare challenge"
+			ok = false
+		}
 	}
 	return map[string]any{"ok": ok, "status": resp.StatusCode, "latency_ms": latency, "error": message}
+}
+
+func isLikelyCloudflareChallenge(status int, body []byte) bool {
+	if status != http.StatusForbidden && status != http.StatusServiceUnavailable {
+		return false
+	}
+	lower := strings.ToLower(string(body))
+	return strings.Contains(lower, "just a moment") ||
+		strings.Contains(lower, "cf-browser-verification") ||
+		strings.Contains(lower, "challenge-platform") ||
+		strings.Contains(lower, "enable javascript and cookies") ||
+		strings.Contains(lower, "_cf_chl")
 }
 
 func browserHTTPClient(proxy string, timeout time.Duration) *http.Client {
@@ -108,8 +144,24 @@ func browserHTTPClientForProfile(proxy, profile string, timeout time.Duration) *
 }
 
 func applyBrowserProfile(builder *surf.Builder, profile string) *surf.Builder {
-	impersonate := builder.Impersonate()
 	normalized := strings.ToLower(strings.TrimSpace(profile))
+
+	// Explicit JA3 profiles (used when account/fp requests chrome110/edge/etc.).
+	// These map closer to curl_cffi impersonation targets used by the Python fork.
+	switch {
+	case strings.Contains(normalized, "chrome110"), strings.Contains(normalized, "chrome100"),
+		strings.Contains(normalized, "chrome102"), strings.Contains(normalized, "chrome106"):
+		return builder.JA().Chrome106()
+	case strings.Contains(normalized, "chrome120"):
+		return builder.JA().Chrome120()
+	case strings.Contains(normalized, "edge106"), strings.Contains(normalized, "edge101"),
+		strings.HasPrefix(normalized, "edge"):
+		return builder.JA().Edge106()
+	case strings.Contains(normalized, "chrome145"):
+		return builder.JA().Chrome145()
+	}
+
+	impersonate := builder.Impersonate()
 	switch {
 	case strings.Contains(normalized, "android"):
 		impersonate = impersonate.Android()
@@ -124,6 +176,11 @@ func applyBrowserProfile(builder *surf.Builder, profile string) *surf.Builder {
 	}
 	if strings.Contains(normalized, "firefox") || strings.Contains(normalized, "ff") {
 		return impersonate.Firefox()
+	}
+	// Default Impersonate().Chrome() is chrome145 in current surf.
+	// Prefer chrome106 JA for empty/generic profiles to better match Python chrome110.
+	if normalized == "" || normalized == "chrome" || normalized == "chrome110" {
+		return builder.JA().Chrome106()
 	}
 	return impersonate.Chrome()
 }

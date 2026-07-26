@@ -39,6 +39,53 @@ function toggleListValue(values: string[], value: string, checked: boolean) {
   return Array.from(current).sort();
 }
 
+type PermissionBundle = {
+  id: string;
+  label: string;
+  description: string;
+  menuPaths: string[];
+  apiPermissions: string[];
+};
+
+const permissionBundles: PermissionBundle[] = [
+  {
+    id: "external-image-use",
+    label: "API 生图",
+    description: "使用已启用渠道，提交、查看和取消自己的 API 生图任务。",
+    menuPaths: ["/external-image"],
+    apiPermissions: [
+      "get/api/external-image-providers",
+      "get/api/external-image-tasks",
+      "post/api/external-image-tasks",
+      "delete/api/external-image-tasks",
+    ],
+  },
+  {
+    id: "external-image-manage",
+    label: "渠道配置",
+    description: "管理渠道、API Key、连接测试和 API 生图运行限制。",
+    menuPaths: ["/external-image/providers"],
+    apiPermissions: [
+      "get/api/admin/external-image-providers",
+      "post/api/admin/external-image-providers",
+      "patch/api/admin/external-image-providers",
+      "delete/api/admin/external-image-providers",
+    ],
+  },
+];
+
+const bundledMenuPaths = new Set(permissionBundles.flatMap((bundle) => bundle.menuPaths));
+const bundledApiPermissions = new Set(permissionBundles.flatMap((bundle) => bundle.apiPermissions));
+
+function setListValues(values: string[], targets: string[], checked: boolean) {
+  const next = new Set(values);
+  targets.forEach((target) => {
+    if (checked) next.add(target);
+    else next.delete(target);
+  });
+  return Array.from(next).sort();
+}
+
 function apiMethodClass(method: string) {
   switch (method.toUpperCase()) {
     case "GET":
@@ -73,13 +120,54 @@ export function PermissionEditor({
   onApiPermissionsChange,
   className,
 }: PermissionEditorProps) {
-  const menuPermissions = useMemo(() => flattenMenuPermissions(menus), [menus]);
-  const apiPermissionGroups = useMemo(() => groupApiPermissions(apis), [apis]);
-  const allMenuPaths = useMemo(() => menuPermissions.map((item) => item.path), [menuPermissions]);
+  const allMenuPermissions = useMemo(() => flattenMenuPermissions(menus), [menus]);
+  const menuPermissions = useMemo(
+    () => allMenuPermissions.filter((item) => !bundledMenuPaths.has(item.path)),
+    [allMenuPermissions],
+  );
+  const visibleApiPermissions = useMemo(
+    () => apis.filter((item) => !bundledApiPermissions.has(item.key)),
+    [apis],
+  );
+  const apiPermissionGroups = useMemo(() => groupApiPermissions(visibleApiPermissions), [visibleApiPermissions]);
+  const allMenuPaths = useMemo(() => allMenuPermissions.map((item) => item.path), [allMenuPermissions]);
   const allApiPermissionKeys = useMemo(() => apis.map((item) => item.key), [apis]);
 
   return (
     <div className={cn("grid min-h-0 gap-5 lg:grid-cols-[280px_1fr]", className)}>
+      <section className="overflow-hidden rounded-xl border border-border lg:col-span-2">
+        <div className="border-b border-border px-4 py-3">
+          <h3 className="text-sm font-semibold text-foreground">功能权限</h3>
+          <p className="mt-1 text-xs text-muted-foreground">一个开关会同步对应页面与接口权限。</p>
+        </div>
+        <div className="grid gap-3 p-4 md:grid-cols-2">
+          {permissionBundles.map((bundle) => {
+            const targets = [...bundle.menuPaths, ...bundle.apiPermissions];
+            const selectedCount = bundle.menuPaths.filter((path) => selectedMenuPaths.includes(path)).length
+              + bundle.apiPermissions.filter((key) => selectedApiPermissions.includes(key)).length;
+            const checked = selectedCount === targets.length;
+            const indeterminate = selectedCount > 0 && !checked;
+            return (
+              <label key={bundle.id} className="flex cursor-pointer items-start gap-3 rounded-lg border border-border px-4 py-4 transition hover:bg-muted/50">
+                <Checkbox
+                  checked={indeterminate ? "indeterminate" : checked}
+                  onCheckedChange={(value) => {
+                    const nextChecked = value === true;
+                    onMenuPathsChange(setListValues(selectedMenuPaths, bundle.menuPaths, nextChecked));
+                    onApiPermissionsChange(setListValues(selectedApiPermissions, bundle.apiPermissions, nextChecked));
+                  }}
+                  className="mt-0.5"
+                />
+                <span className="min-w-0">
+                  <span className="block text-sm font-semibold text-foreground">{bundle.label}</span>
+                  <span className="mt-1 block text-xs leading-5 text-muted-foreground">{bundle.description}</span>
+                </span>
+              </label>
+            );
+          })}
+        </div>
+      </section>
+
       <section className="flex min-h-0 min-w-0 flex-col overflow-hidden rounded-xl border border-border">
         <div className="flex items-center justify-between gap-3 border-b border-border px-4 py-3">
           <div className="min-w-0">

@@ -10,6 +10,15 @@ import (
 	"chatgpt2api/internal/util"
 )
 
+func TestBillingServiceReportsInitializationFailure(t *testing.T) {
+	backend := newFailingStorageBackend(t)
+	backend.failDocumentLoad = billingDocumentName
+	service := NewBillingService(backend, nil)
+	if service.InitializationError() == nil {
+		t.Fatal("InitializationError() = nil")
+	}
+}
+
 type testBillingDefaults struct {
 	billingType        string
 	standardBalance    int
@@ -50,6 +59,33 @@ func newTestBillingServiceAt(t *testing.T, defaults testBillingDefaults) *Billin
 
 func billingTestUser(id string) Identity {
 	return Identity{ID: id, Name: id, Role: AuthRoleUser, CredentialID: "cred-" + id}
+}
+
+func TestBillingServiceRollsBackFailedChargeAndRefundPersistence(t *testing.T) {
+	backend := newFailingStorageBackend(t)
+	svc := NewBillingService(backend, testBillingDefaults{standardBalance: 10})
+	svc.InitializeUserDefaults("alice")
+
+	backend.failAllDocument = true
+	if _, err := svc.ChargeUserID("alice", 3, BillingReference{ChargeKey: "charge-failed"}); err == nil {
+		t.Fatal("ChargeUserID() succeeded when persistence failed")
+	}
+	backend.failAllDocument = false
+	if available := util.ToInt(svc.Get("alice")["available"], -1); available != 10 {
+		t.Fatalf("available after failed charge = %d, want 10", available)
+	}
+
+	if _, err := svc.ChargeUserID("alice", 3, BillingReference{ChargeKey: "charge-ok"}); err != nil {
+		t.Fatalf("ChargeUserID() error = %v", err)
+	}
+	backend.failAllDocument = true
+	if _, err := svc.RefundUserID("alice", 2, BillingReference{ChargeKey: "refund-failed", RefundForKey: "charge-ok"}); err == nil {
+		t.Fatal("RefundUserID() succeeded when persistence failed")
+	}
+	backend.failAllDocument = false
+	if available := util.ToInt(svc.Get("alice")["available"], -1); available != 7 {
+		t.Fatalf("available after failed refund = %d, want 7", available)
+	}
 }
 
 func TestBillingServiceDefaults(t *testing.T) {
@@ -165,10 +201,25 @@ func TestBillingServiceMissingStateDoesNotUseCurrentDefaults(t *testing.T) {
 		t.Fatalf("missing user billing should not inherit current defaults = %#v", got)
 	}
 
-	initialized := svc.InitializeUserDefaults("new-user")
+	initialized, err := svc.InitializeUserDefaults("new-user")
+	if err != nil {
+		t.Fatalf("InitializeUserDefaults() error = %v", err)
+	}
 	subscription := util.StringMap(initialized["subscription"])
 	if initialized["type"] != BillingTypeSubscription || util.ToInt(initialized["available"], -1) != 12 || subscription["quota_period"] != BillingPeriodWeekly {
 		t.Fatalf("initialized user billing should use current defaults = %#v", initialized)
+	}
+}
+
+func TestBillingServiceReportsDefaultInitializationPersistenceFailure(t *testing.T) {
+	backend := newFailingStorageBackend(t)
+	svc := NewBillingService(backend, testBillingDefaults{standardBalance: 10})
+	backend.failDocument = billingDocumentName
+	if _, err := svc.InitializeUserDefaults("new-user"); err == nil {
+		t.Fatal("InitializeUserDefaults() succeeded when persistence failed")
+	}
+	if _, exists := svc.states["new-user"]; exists {
+		t.Fatal("failed default initialization changed in-memory state")
 	}
 }
 

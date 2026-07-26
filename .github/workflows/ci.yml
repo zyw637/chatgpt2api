@@ -36,7 +36,10 @@ jobs:
 
       - name: Build frontend
         working-directory: web
-        run: bun run build
+        run: |
+          bun run lint
+          bun run test
+          bun run build
 
       - name: Upload frontend artifact
         uses: actions/upload-artifact@v7

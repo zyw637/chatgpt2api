@@ -7,6 +7,86 @@ import (
 	"testing"
 )
 
+func TestAppRejectsOversizedRequestBodiesBeforeRouting(t *testing.T) {
+	for _, tc := range []struct {
+		name        string
+		path        string
+		contentType string
+		limit       int64
+	}{
+		{name: "json", path: "/api/test", contentType: "application/json", limit: maxJSONRequestBodyBytes},
+		{name: "image multipart", path: "/v1/images/edits", contentType: "multipart/form-data; boundary=test", limit: maxMultipartRequestBodyBytes},
+		{name: "external multipart", path: "/api/external-image-tasks/generations", contentType: "multipart/form-data; boundary=test", limit: maxExternalMultipartBytes},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			called := false
+			app := &App{}
+			routes := []appRoute{exact(http.MethodPost, tc.path, func(w http.ResponseWriter, _ *http.Request) {
+				called = true
+				w.WriteHeader(http.StatusNoContent)
+			})}
+			req := httptest.NewRequest(http.MethodPost, tc.path, strings.NewReader("x"))
+			req.Header.Set("Content-Type", tc.contentType)
+			req.ContentLength = tc.limit + 1
+			res := httptest.NewRecorder()
+
+			app.serveObservedHTTP(res, req, routes)
+
+			if res.Code != http.StatusRequestEntityTooLarge {
+				t.Fatalf("status = %d body = %s", res.Code, res.Body.String())
+			}
+			if called {
+				t.Fatal("oversized request reached route handler")
+			}
+		})
+	}
+}
+
+func TestAppRejectsChunkedJSONBodyOverLimit(t *testing.T) {
+	body := `{"value":"` + strings.Repeat("a", maxJSONRequestBodyBytes) + `"}`
+	app := &App{}
+	routes := []appRoute{exact(http.MethodPost, "/api/test", func(w http.ResponseWriter, r *http.Request) {
+		_, err := readJSONMap(r)
+		if err != nil {
+			writeRequestBodyError(w, err, "invalid json body")
+			return
+		}
+		w.WriteHeader(http.StatusNoContent)
+	})}
+	req := httptest.NewRequest(http.MethodPost, "/api/test", strings.NewReader(body))
+	req.Header.Set("Content-Type", "application/json")
+	req.ContentLength = -1
+	res := httptest.NewRecorder()
+
+	app.serveObservedHTTP(res, req, routes)
+
+	if res.Code != http.StatusRequestEntityTooLarge {
+		t.Fatalf("status = %d body = %s", res.Code, res.Body.String())
+	}
+}
+
+func TestAppRejectsChunkedJSONBodyWithOversizedTrailingData(t *testing.T) {
+	body := `{}` + strings.Repeat(" ", maxJSONRequestBodyBytes)
+	app := &App{}
+	routes := []appRoute{exact(http.MethodPost, "/api/test", func(w http.ResponseWriter, r *http.Request) {
+		if _, err := readJSONMap(r); err != nil {
+			writeRequestBodyError(w, err, "invalid json body")
+			return
+		}
+		w.WriteHeader(http.StatusNoContent)
+	})}
+	req := httptest.NewRequest(http.MethodPost, "/api/test", strings.NewReader(body))
+	req.Header.Set("Content-Type", "application/json")
+	req.ContentLength = -1
+	res := httptest.NewRecorder()
+
+	app.serveObservedHTTP(res, req, routes)
+
+	if res.Code != http.StatusRequestEntityTooLarge {
+		t.Fatalf("status = %d body = %s", res.Code, res.Body.String())
+	}
+}
+
 func TestMatchAppRoute(t *testing.T) {
 	routes := []appRoute{
 		exact(http.MethodGet, "/version", nil),
@@ -56,14 +136,14 @@ func TestAppRouterKeepsAPIMissesOutOfSPA(t *testing.T) {
 	req = httptest.NewRequest(http.MethodGet, "/settings", nil)
 	res = httptest.NewRecorder()
 	app.Handler().ServeHTTP(res, req)
-	if res.Code != http.StatusOK || !strings.Contains(res.Body.String(), `<div id="root"></div>`) {
+	if res.Code != http.StatusOK || !strings.Contains(res.Body.String(), `<div id="root">`) || !strings.Contains(res.Body.String(), `id="pwa-boot"`) {
 		t.Fatalf("SPA route status/body = %d %q", res.Code, res.Body.String())
 	}
 
 	req = httptest.NewRequest(http.MethodGet, "/auth/linuxdo/callback", nil)
 	res = httptest.NewRecorder()
 	app.Handler().ServeHTTP(res, req)
-	if res.Code != http.StatusOK || !strings.Contains(res.Body.String(), `<div id="root"></div>`) {
+	if res.Code != http.StatusOK || !strings.Contains(res.Body.String(), `<div id="root">`) || !strings.Contains(res.Body.String(), `id="pwa-boot"`) {
 		t.Fatalf("Linuxdo frontend callback status/body = %d %q", res.Code, res.Body.String())
 	}
 

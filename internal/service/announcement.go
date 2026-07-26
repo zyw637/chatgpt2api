@@ -1,6 +1,7 @@
 package service
 
 import (
+	"fmt"
 	"sync"
 
 	"chatgpt2api/internal/storage"
@@ -12,13 +13,16 @@ type AnnouncementService struct {
 	store   storage.JSONDocumentBackend
 	items   []map[string]any
 	docName string
+	initErr error
 }
 
 func NewAnnouncementService(backend ...storage.Backend) *AnnouncementService {
 	s := &AnnouncementService{store: firstJSONDocumentStore(backend), docName: "announcements.json"}
-	s.items = s.load()
+	s.items, s.initErr = s.load()
 	return s
 }
+
+func (s *AnnouncementService) InitializationError() error { return s.initErr }
 
 func (s *AnnouncementService) ListAll() []map[string]any {
 	s.mu.Lock()
@@ -39,7 +43,7 @@ func (s *AnnouncementService) ListVisible(target string) []map[string]any {
 	return out
 }
 
-func (s *AnnouncementService) Create(updates map[string]any) map[string]any {
+func (s *AnnouncementService) Create(updates map[string]any) (map[string]any, error) {
 	now := util.NowISO()
 	id := util.NewHex(12)
 	item := normalizeAnnouncement(mergeMaps(map[string]any{
@@ -55,14 +59,17 @@ func (s *AnnouncementService) Create(updates map[string]any) map[string]any {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	s.items = append(s.items, item)
-	_ = s.saveLocked()
-	return util.CopyMap(item)
+	if err := s.saveLocked(); err != nil {
+		s.items = s.items[:len(s.items)-1]
+		return nil, err
+	}
+	return util.CopyMap(item), nil
 }
 
-func (s *AnnouncementService) Update(id string, updates map[string]any) map[string]any {
+func (s *AnnouncementService) Update(id string, updates map[string]any) (map[string]any, error) {
 	id = util.Clean(id)
 	if id == "" {
-		return nil
+		return nil, nil
 	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -76,19 +83,23 @@ func (s *AnnouncementService) Update(id string, updates map[string]any) map[stri
 			"updated_at": util.NowISO(),
 		}))
 		s.items[index] = next
-		_ = s.saveLocked()
-		return util.CopyMap(next)
+		if err := s.saveLocked(); err != nil {
+			s.items[index] = item
+			return nil, err
+		}
+		return util.CopyMap(next), nil
 	}
-	return nil
+	return nil, nil
 }
 
-func (s *AnnouncementService) Delete(id string) bool {
+func (s *AnnouncementService) Delete(id string) (bool, error) {
 	id = util.Clean(id)
 	if id == "" {
-		return false
+		return false, nil
 	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	previous := append([]map[string]any(nil), s.items...)
 	next := s.items[:0]
 	removed := false
 	for _, item := range s.items {
@@ -100,13 +111,22 @@ func (s *AnnouncementService) Delete(id string) bool {
 	}
 	if removed {
 		s.items = next
-		_ = s.saveLocked()
+		if err := s.saveLocked(); err != nil {
+			s.items = previous
+			return false, err
+		}
 	}
-	return removed
+	return removed, nil
 }
 
-func (s *AnnouncementService) load() []map[string]any {
-	raw := loadStoredJSON(s.store, s.docName)
+func (s *AnnouncementService) load() ([]map[string]any, error) {
+	if s.store == nil {
+		return nil, fmt.Errorf("announcement document backend is required")
+	}
+	raw, err := s.store.LoadJSONDocument(s.docName)
+	if err != nil {
+		return nil, err
+	}
 	items := make([]map[string]any, 0)
 	for _, item := range anyList(raw) {
 		if itemMap, ok := item.(map[string]any); ok {
@@ -116,7 +136,7 @@ func (s *AnnouncementService) load() []map[string]any {
 			}
 		}
 	}
-	return items
+	return items, nil
 }
 
 func (s *AnnouncementService) saveLocked() error {

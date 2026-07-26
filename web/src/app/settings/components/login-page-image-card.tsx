@@ -1,11 +1,12 @@
 "use client";
 
 import { useEffect, useRef, useState } from "react";
-import { ImageIcon, LoaderCircle, RotateCcw, Save, Upload } from "lucide-react";
+import { ImageIcon, RotateCcw, Save, Upload } from "lucide-react";
 import { toast } from "sonner";
 
 import { LoginPageImageEditor } from "@/components/login-page-image-editor";
 import { Button } from "@/components/ui/button";
+import { ApiLoadingMark } from "@/components/api-loading-mark";
 import { Field, FieldLabel } from "@/components/ui/field";
 import { Input } from "@/components/ui/input";
 import {
@@ -68,7 +69,7 @@ export function LoginPageImageCard() {
         tone="violet"
       >
         <div className="flex items-center justify-center py-10">
-          <LoaderCircle className="size-5 animate-spin text-muted-foreground" />
+          <ApiLoadingMark size="section" label="正在加载登录页图片配置" />
         </div>
       </SettingsCard>
     );
@@ -113,7 +114,7 @@ export function LoginPageImageCard() {
           disabled={isSavingConfig}
         >
           {isSavingConfig ? (
-            <LoaderCircle data-icon="inline-start" className="animate-spin" />
+            <ApiLoadingMark size="inline" label="正在保存登录页图片" />
           ) : (
             <Save data-icon="inline-start" />
           )}

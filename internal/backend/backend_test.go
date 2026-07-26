@@ -33,6 +33,55 @@ func newTestBackendClient(server *httptest.Server) *Client {
 	return client
 }
 
+func TestBrowserHTTPTimeoutUsesGetterAndBounds(t *testing.T) {
+	t.Cleanup(func() { SetBrowserHTTPTimeoutGetter(nil) })
+
+	if got := browserHTTPTimeout(); got != defaultBrowserHTTPTimeout {
+		t.Fatalf("default timeout = %v, want %v", got, defaultBrowserHTTPTimeout)
+	}
+
+	SetBrowserHTTPTimeoutGetter(func() time.Duration { return 720 * time.Second })
+	if got := browserHTTPTimeout(); got != 720*time.Second {
+		t.Fatalf("configured timeout = %v, want 720s", got)
+	}
+
+	SetBrowserHTTPTimeoutGetter(func() time.Duration { return 5 * time.Second })
+	if got := browserHTTPTimeout(); got != minBrowserHTTPTimeout {
+		t.Fatalf("below-min timeout = %v, want %v", got, minBrowserHTTPTimeout)
+	}
+
+	SetBrowserHTTPTimeoutGetter(func() time.Duration { return 7200 * time.Second })
+	if got := browserHTTPTimeout(); got != maxBrowserHTTPTimeout {
+		t.Fatalf("above-max timeout = %v, want %v", got, maxBrowserHTTPTimeout)
+	}
+
+	SetBrowserHTTPTimeoutGetter(func() time.Duration { return 0 })
+	if got := browserHTTPTimeout(); got != defaultBrowserHTTPTimeout {
+		t.Fatalf("zero timeout = %v, want %v", got, defaultBrowserHTTPTimeout)
+	}
+}
+
+func TestEnsureBrowserHTTPTimeoutUpdatesInjectedClient(t *testing.T) {
+	t.Cleanup(func() { SetBrowserHTTPTimeoutGetter(nil) })
+	SetBrowserHTTPTimeoutGetter(func() time.Duration { return 720 * time.Second })
+
+	client := &Client{httpClient: &http.Client{Timeout: 30 * time.Second}, httpTimeout: 30 * time.Second}
+	client.ensureBrowserHTTPTimeout()
+	if client.httpTimeout != 720*time.Second {
+		t.Fatalf("httpTimeout = %v, want 720s", client.httpTimeout)
+	}
+	if client.httpClient.Timeout != 720*time.Second {
+		t.Fatalf("httpClient.Timeout = %v, want 720s", client.httpClient.Timeout)
+	}
+
+	// No-op when already aligned.
+	previous := client.httpClient
+	client.ensureBrowserHTTPTimeout()
+	if client.httpClient != previous {
+		t.Fatal("ensureBrowserHTTPTimeout rebuilt client when timeout was unchanged")
+	}
+}
+
 func setOfficialImageDownloadRetryDelayForTest(delay time.Duration) func() {
 	previous := officialImageDownloadRetryDelay
 	officialImageDownloadRetryDelay = delay
@@ -52,6 +101,59 @@ func TestUpstreamHTTPErrorSummarizesCloudflareChallenge(t *testing.T) {
 	}
 	if strings.Contains(got, "<html>") || strings.Contains(got, "window._cf_chl_opt") {
 		t.Fatalf("error leaked challenge HTML: %q", got)
+	}
+}
+
+func TestBootstrapUsesDefaultPOWWhenHomepageReturnsCloudflareChallenge(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusForbidden)
+		_, _ = w.Write([]byte(`<html><script>window._cf_chl_opt={}</script>Enable JavaScript and cookies to continue</html>`))
+	}))
+	defer server.Close()
+
+	client := newTestBackendClient(server)
+	if err := client.bootstrap(context.Background()); err == nil {
+		t.Fatal("bootstrap() error = nil, want challenge error after retries")
+	}
+	if len(client.powSources) != 1 || client.powSources[0] != defaultPOWScript {
+		t.Fatalf("powSources = %#v, want default script", client.powSources)
+	}
+}
+
+func TestBootstrapStillRejectsNonChallengeForbidden(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusForbidden)
+		_, _ = w.Write([]byte(`{"detail":"forbidden"}`))
+	}))
+	defer server.Close()
+
+	client := newTestBackendClient(server)
+	err := client.bootstrap(context.Background())
+	if err == nil || !strings.Contains(err.Error(), `status=403`) {
+		t.Fatalf("bootstrap() error = %v, want forbidden error", err)
+	}
+}
+
+func TestBootstrapRetriesCloudflareChallenge(t *testing.T) {
+	attempts := 0
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		attempts++
+		if attempts < 3 {
+			w.WriteHeader(http.StatusForbidden)
+			_, _ = w.Write([]byte(`<html><script>window._cf_chl_opt={}</script>Enable JavaScript and cookies to continue</html>`))
+			return
+		}
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write([]byte(`<html><script>pow-script</script></html>`))
+	}))
+	defer server.Close()
+
+	client := newTestBackendClient(server)
+	if err := client.bootstrap(context.Background()); err != nil {
+		t.Fatalf("bootstrap() error = %v", err)
+	}
+	if attempts != 3 {
+		t.Fatalf("attempts = %d, want 3", attempts)
 	}
 }
 
@@ -1549,3 +1651,40 @@ func TestSolveTurnstileTokenInterpretsEncodedProgram(t *testing.T) {
 type errString string
 
 func (e errString) Error() string { return string(e) }
+
+
+func TestStableFingerprintPerToken(t *testing.T) {
+	clientA := NewClient("token-stable-1", nil, nil)
+	clientB := NewClient("token-stable-1", nil, nil)
+	clientC := NewClient("token-stable-2", nil, nil)
+	if clientA.deviceID == "" || clientA.sessionID == "" {
+		t.Fatal("device/session id should be set")
+	}
+	if clientA.deviceID != clientB.deviceID {
+		t.Fatalf("same token should reuse device id: %q vs %q", clientA.deviceID, clientB.deviceID)
+	}
+	if clientA.deviceID == clientC.deviceID {
+		t.Fatal("different tokens should not share device id")
+	}
+	if clientA.fp["impersonate"] != browserImpersonationProfile {
+		t.Fatalf("impersonate = %q, want %q", clientA.fp["impersonate"], browserImpersonationProfile)
+	}
+	if !strings.Contains(clientA.userAgent, "Edg/") {
+		t.Fatalf("default UA should look like Edge: %q", clientA.userAgent)
+	}
+}
+
+func TestClientPoolReusesBootstrappedClient(t *testing.T) {
+	invalidatePooledClient(clientPoolKey("pool-token-1", ""))
+	first := NewClient("pool-token-1", nil, nil)
+	first.bootstrapped = true
+	first.powSources = []string{"pow-a"}
+	second := NewClient("pool-token-1", nil, nil)
+	if first != second {
+		t.Fatal("NewClient should return pooled client for same token")
+	}
+	if !second.bootstrapped || len(second.powSources) != 1 || second.powSources[0] != "pow-a" {
+		t.Fatalf("pooled client lost bootstrap state: bootstrapped=%v sources=%v", second.bootstrapped, second.powSources)
+	}
+	invalidatePooledClient(clientPoolKey("pool-token-1", ""))
+}

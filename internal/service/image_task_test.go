@@ -51,7 +51,6 @@ func TestImageTaskServiceIdempotencyOwnerIsolationAndCompletion(t *testing.T) {
 		t.Fatalf("bob missing ids = %#v", got)
 	}
 }
-
 func TestImageTaskServiceUsesOwnerIDAroundCredentialRotation(t *testing.T) {
 	handlerCalls := make(chan map[string]any, 4)
 	handler := func(ctx context.Context, identity Identity, payload map[string]any) (map[string]any, error) {
@@ -349,6 +348,50 @@ func TestImageTaskServicePublishesPartialImageDataWhileRunning(t *testing.T) {
 	})
 	close(release)
 	waitForTaskStatus(t, svc, identity, "task-1", TaskStatusSuccess)
+}
+
+
+func TestImageTaskServiceMarksRunningWhenWorkerStarts(t *testing.T) {
+	started := make(chan struct{})
+	release := make(chan struct{})
+	handler := func(ctx context.Context, identity Identity, payload map[string]any) (map[string]any, error) {
+		close(started)
+		select {
+		case <-release:
+		case <-ctx.Done():
+			return nil, ctx.Err()
+		}
+		return map[string]any{"data": []map[string]any{{"url": "https://example.test/early-running.png"}}}, nil
+	}
+	svc := newTestImageTaskService(t, handler, handler, handler, func() int { return 30 })
+	identity := Identity{ID: "alice", Name: "Alice", Role: AuthRoleAdmin}
+
+	if _, err := svc.SubmitGeneration(context.Background(), identity, "task-early-running", "draw", "gpt-image-2", "1024x1024", "high", "https://base.test", 1, nil); err != nil {
+		t.Fatalf("SubmitGeneration() error = %v", err)
+	}
+	select {
+	case <-started:
+	case <-time.After(2 * time.Second):
+		t.Fatal("timed out waiting for handler start")
+	}
+
+	// Task must be running while the handler is still blocked (before any image
+	// output slot is acquired / partial data is published).
+	deadline := time.Now().Add(2 * time.Second)
+	for {
+		list := svc.ListTasks(identity, []string{"task-early-running"})
+		items := util.AsMapSlice(list["items"])
+		if len(items) == 1 && util.Clean(items[0]["status"]) == TaskStatusRunning {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("task did not become running before image output; got %#v", list)
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+
+	close(release)
+	waitForTaskStatus(t, svc, identity, "task-early-running", TaskStatusSuccess)
 }
 
 func TestImageTaskServiceLimitsUserDefaultConcurrentCreationUnits(t *testing.T) {
@@ -1041,6 +1084,86 @@ func TestImageTaskServiceRestoresUnfinishedTasksAsErrors(t *testing.T) {
 func newTestImageTaskService(t *testing.T, generation ImageTaskHandler, edit ImageTaskHandler, chat ImageTaskHandler, retentionGetter func() int, limitGetters ...func() int) *ImageTaskService {
 	t.Helper()
 	return NewStoredImageTaskService(newTestStorageBackend(t), generation, edit, chat, retentionGetter, limitGetters...)
+}
+
+func TestImageTaskServiceCloseCancelsWorkersAndRejectsSubmissions(t *testing.T) {
+	started := make(chan struct{})
+	handler := func(ctx context.Context, _ Identity, _ map[string]any) (map[string]any, error) {
+		close(started)
+		<-ctx.Done()
+		return nil, ctx.Err()
+	}
+	svc := newTestImageTaskService(t, handler, failingImageTaskHandler, failingImageTaskHandler, func() int { return 30 })
+	identity := Identity{ID: "user-1", OwnerID: "user-1", Role: AuthRoleUser}
+	if _, err := svc.SubmitGeneration(context.Background(), identity, "closing-task", "draw", "auto", "", "", "", 1, nil); err != nil {
+		t.Fatalf("SubmitGeneration() error = %v", err)
+	}
+	select {
+	case <-started:
+	case <-time.After(2 * time.Second):
+		t.Fatal("timed out waiting for task handler")
+	}
+
+	closed := make(chan struct{})
+	go func() {
+		svc.Close()
+		close(closed)
+	}()
+	select {
+	case <-closed:
+	case <-time.After(2 * time.Second):
+		t.Fatal("Close() did not wait for cancelled worker to exit")
+	}
+
+	items := svc.ListTasks(identity, []string{"closing-task"})["items"].([]map[string]any)
+	if len(items) != 1 || items[0]["status"] != TaskStatusCancelled {
+		t.Fatalf("closed task = %#v", items)
+	}
+	if _, err := svc.SubmitGeneration(context.Background(), identity, "after-close", "draw", "auto", "", "", "", 1, nil); err == nil {
+		t.Fatal("submission after Close() succeeded")
+	}
+	svc.Close()
+}
+
+func TestWaitForServiceWorkersReturnsOnTimeout(t *testing.T) {
+	var workers sync.WaitGroup
+	workers.Add(1)
+	if waitForServiceWorkers(&workers, 10*time.Millisecond) {
+		t.Fatal("waitForServiceWorkers() succeeded before worker completion")
+	}
+	workers.Done()
+	if !waitForServiceWorkers(&workers, time.Second) {
+		t.Fatal("waitForServiceWorkers() timed out after worker completion")
+	}
+}
+
+func TestImageTaskServiceRollsBackTaskAndBillingWhenPersistenceFails(t *testing.T) {
+	backend := newFailingStorageBackend(t)
+	billing := NewBillingService(backend, testBillingDefaults{standardBalance: 5})
+	billing.InitializeUserDefaults("alice")
+	handlerCalled := false
+	handler := func(context.Context, Identity, map[string]any) (map[string]any, error) {
+		handlerCalled = true
+		return map[string]any{"data": []map[string]any{{"url": "https://example.test/image.png"}}}, nil
+	}
+	svc := NewStoredImageTaskService(backend, handler, handler, handler, func() int { return 30 })
+	svc.SetBillingService(billing)
+	identity := Identity{ID: "alice", OwnerID: "alice", Role: AuthRoleUser}
+	backend.failDocument = "image_tasks.json"
+
+	if _, err := svc.SubmitGeneration(context.Background(), identity, "failed-save", "draw", "auto", "", "", "", 1, nil); err == nil {
+		t.Fatal("SubmitGeneration() succeeded when task persistence failed")
+	}
+	if handlerCalled {
+		t.Fatal("task handler ran after task persistence failed")
+	}
+	items := svc.ListTasks(identity, []string{"failed-save"})["items"].([]map[string]any)
+	if len(items) != 0 {
+		t.Fatalf("failed task remained in memory: %#v", items)
+	}
+	if available := util.ToInt(billing.Get("alice")["available"], -1); available != 5 {
+		t.Fatalf("available after failed task persistence = %d, want 5", available)
+	}
 }
 
 func waitForStartedTask(t *testing.T, started <-chan string) string {

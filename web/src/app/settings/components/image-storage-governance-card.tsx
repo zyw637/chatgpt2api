@@ -5,12 +5,12 @@ import {
   Database,
   HardDrive,
   Image as ImageIcon,
-  LoaderCircle,
   RefreshCw,
   Trash2,
 } from "lucide-react";
 
 import { Button } from "@/components/ui/button";
+import { ApiLoadingMark } from "@/components/api-loading-mark";
 import {
   Dialog,
   DialogClose,
@@ -161,11 +161,7 @@ export function ImageStorageGovernanceCard() {
           onClick={() => void loadImageStorageGovernance()}
           disabled={isLoadingImageStorageGovernance}
         >
-          {isLoadingImageStorageGovernance ? (
-            <LoaderCircle data-icon="inline-start" className="animate-spin" />
-          ) : (
-            <RefreshCw data-icon="inline-start" />
-          )}
+          <RefreshCw data-icon="inline-start" className={cn(isLoadingImageStorageGovernance && "animate-spin")} />
           刷新
         </Button>
       }
@@ -173,7 +169,7 @@ export function ImageStorageGovernanceCard() {
       <div className="flex flex-col gap-5">
         {isLoadingImageStorageGovernance && !governance ? (
           <div className="flex items-center justify-center rounded-[16px] border border-border/80 bg-background py-10">
-            <LoaderCircle className="size-5 animate-spin text-muted-foreground" />
+            <ApiLoadingMark size="section" label="正在加载图片存储统计" />
           </div>
         ) : (
           <>
@@ -319,7 +315,7 @@ export function ImageStorageGovernanceCard() {
               disabled={isCleaningImageStorage}
             >
               {isCleaningImageStorage ? (
-                <LoaderCircle data-icon="inline-start" className="animate-spin" />
+                <ApiLoadingMark size="inline" label="正在清理图片存储" />
               ) : (
                 <Trash2 data-icon="inline-start" />
               )}

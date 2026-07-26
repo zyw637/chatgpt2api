@@ -16,7 +16,6 @@ export type AuthMenuItem = {
 };
 
 export type StoredAuthSession = {
-  key: string;
   role: AuthRole;
   roleId?: string;
   roleName?: string;
@@ -80,26 +79,25 @@ function normalizeMenus(value: unknown): AuthMenuItem[] {
   });
 }
 
-function normalizeSession(value: unknown, fallbackKey = ""): StoredAuthSession | null {
+function normalizeSession(value: unknown): StoredAuthSession | null {
   if (!value || typeof value !== "object") {
     return null;
   }
 
   const candidate = value as Partial<StoredAuthSession>;
-  const key = String(candidate.key || fallbackKey || "").trim();
+  const subjectId = String(candidate.subjectId || "").trim();
   const role = candidate.role === "admin" || candidate.role === "user" ? candidate.role : null;
   const creationConcurrentLimit = Number(candidate.creationConcurrentLimit);
   const creationRpmLimit = Number(candidate.creationRpmLimit ?? 0);
-  if (!key || !role || !Number.isFinite(creationConcurrentLimit) || creationConcurrentLimit < 0) {
+  if (!subjectId || !role || !Number.isFinite(creationConcurrentLimit) || creationConcurrentLimit < 0) {
     return null;
   }
 
   return {
-    key,
     role,
     roleId: String(candidate.roleId || "").trim(),
     roleName: String(candidate.roleName || "").trim(),
-    subjectId: String(candidate.subjectId || "").trim(),
+    subjectId,
     name: String(candidate.name || "").trim(),
     provider: String(candidate.provider || "").trim(),
     creationConcurrentLimit,
@@ -168,11 +166,6 @@ export async function getStoredAuthSession() {
   }
 
   return normalizeSession(await authStorage.getItem<StoredAuthSession>(AUTH_SESSION_STORAGE_KEY));
-}
-
-export async function getStoredSessionToken() {
-  const session = await getStoredAuthSession();
-  return session?.key ?? "";
 }
 
 export async function setStoredAuthSession(session: StoredAuthSession) {

@@ -71,6 +71,125 @@ func TestDatabaseBackendStoresDocumentsAndLogs(t *testing.T) {
 	}
 }
 
+func TestDatabaseBackendStoresExternalImageTasksIndependently(t *testing.T) {
+	dbPath := filepath.Join(t.TempDir(), "chatgpt2api.db")
+	backend, err := NewDatabaseBackend("sqlite:///" + filepath.ToSlash(dbPath))
+	if err != nil {
+		t.Fatalf("NewDatabaseBackend() error = %v", err)
+	}
+	defer backend.Close()
+	if err := backend.UpsertExternalImageTask("alice:invalid", map[string]any{"owner_id": "alice"}); err == nil {
+		t.Fatal("UpsertExternalImageTask() accepted a task without updated_at")
+	}
+	if err := backend.UpsertExternalImageTask("alice:invalid", map[string]any{"updated_at": "2026-07-22T08:00:00Z"}); err == nil {
+		t.Fatal("UpsertExternalImageTask() accepted a task without owner_id")
+	}
+
+	now := "2026-07-22T08:00:00Z"
+	first := map[string]any{"id": "first", "owner_id": "alice", "status": "queued", "updated_at": now}
+	second := map[string]any{"id": "second", "owner_id": "alice", "status": "success", "updated_at": now, "marker": "unchanged"}
+	if err := backend.UpsertExternalImageTask("alice:first", first); err != nil {
+		t.Fatalf("UpsertExternalImageTask(first) error = %v", err)
+	}
+	if err := backend.UpsertExternalImageTask("alice:second", second); err != nil {
+		t.Fatalf("UpsertExternalImageTask(second) error = %v", err)
+	}
+
+	first["status"] = "running"
+	first["updated_at"] = "2026-07-22T08:01:00Z"
+	if err := backend.UpsertExternalImageTask("alice:first", first); err != nil {
+		t.Fatalf("UpsertExternalImageTask(update first) error = %v", err)
+	}
+	items, err := backend.LoadExternalImageTasks()
+	if err != nil {
+		t.Fatalf("LoadExternalImageTasks() error = %v", err)
+	}
+	byID := make(map[string]map[string]any, len(items))
+	for _, item := range items {
+		byID[item["id"].(string)] = item
+	}
+	if len(byID) != 2 || byID["first"]["status"] != "running" || byID["second"]["marker"] != "unchanged" {
+		t.Fatalf("external image task records = %#v", items)
+	}
+
+	if err := backend.DeleteExternalImageTasks([]string{"alice:first", "alice:second"}); err != nil {
+		t.Fatalf("DeleteExternalImageTasks() error = %v", err)
+	}
+	items, err = backend.LoadExternalImageTasks()
+	if err != nil || len(items) != 0 {
+		t.Fatalf("tasks after batch delete = %#v, %v", items, err)
+	}
+}
+
+func TestDatabaseBackendRejectsConcurrentSQLiteInstance(t *testing.T) {
+	dbPath := filepath.Join(t.TempDir(), "chatgpt2api.db")
+	dsn := "sqlite:///" + filepath.ToSlash(dbPath)
+	first, err := NewDatabaseBackend(dsn)
+	if err != nil {
+		t.Fatalf("first NewDatabaseBackend() error = %v", err)
+	}
+	defer first.Close()
+	second, err := NewDatabaseBackend(dsn)
+	if second != nil {
+		_ = second.Close()
+	}
+	if err == nil {
+		t.Fatal("second database instance acquired the same SQLite database")
+	}
+}
+
+func TestDatabaseInstanceLockNameIgnoresMySQLCredentials(t *testing.T) {
+	first := databaseInstanceLockName("mysql", "alice:secret-a@tcp(db.example:3306)/chatgpt2api?parseTime=true")
+	second := databaseInstanceLockName("mysql", "bob:secret-b@tcp(db.example:3306)/chatgpt2api?parseTime=true&timeout=5s")
+	if first != second {
+		t.Fatalf("same MySQL database produced different lock names: %q != %q", first, second)
+	}
+	otherDatabase := databaseInstanceLockName("mysql", "alice:secret-a@tcp(db.example:3306)/other?parseTime=true")
+	if first == otherDatabase {
+		t.Fatalf("different MySQL databases produced the same lock name: %q", first)
+	}
+	if strings.Contains(first, "alice") || strings.Contains(first, "secret-a") {
+		t.Fatalf("lock name exposed credentials: %q", first)
+	}
+}
+
+func TestSQLitePoolDoesNotRotateLockedConnection(t *testing.T) {
+	dbPath := filepath.Join(t.TempDir(), "chatgpt2api.db")
+	backend, err := NewDatabaseBackend("sqlite:///" + filepath.ToSlash(dbPath))
+	if err != nil {
+		t.Fatalf("NewDatabaseBackend() error = %v", err)
+	}
+	defer backend.Close()
+
+	before := backend.db.Stats().MaxLifetimeClosed
+	for range 3 {
+		if err := backend.db.Ping(); err != nil {
+			t.Fatalf("Ping() error = %v", err)
+		}
+	}
+	if after := backend.db.Stats().MaxLifetimeClosed; after != before {
+		t.Fatalf("SQLite locked connection rotated: before=%d after=%d", before, after)
+	}
+}
+
+func TestDatabaseBackendDoesNotSkipCorruptRows(t *testing.T) {
+	dbPath := filepath.Join(t.TempDir(), "chatgpt2api.db")
+	backend, err := NewDatabaseBackend("sqlite:///" + filepath.ToSlash(dbPath))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer backend.Close()
+	if _, err := backend.db.Exec(`INSERT INTO accounts (access_token, data) VALUES (?, ?)`, "broken", "not-json"); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := backend.LoadAccounts(); err == nil {
+		t.Fatal("LoadAccounts() accepted corrupt JSON row")
+	}
+	if err := backend.SaveAccounts([]map[string]any{{"access_token": "bad", "value": make(chan int)}}); err == nil {
+		t.Fatal("SaveAccounts() skipped an unserializable row")
+	}
+}
+
 func TestDatabaseBackendQueryLogsEmptyReturnsJSONArray(t *testing.T) {
 	dbPath := filepath.Join(t.TempDir(), "chatgpt2api.db")
 	backend, err := NewDatabaseBackend("sqlite:///" + filepath.ToSlash(dbPath))

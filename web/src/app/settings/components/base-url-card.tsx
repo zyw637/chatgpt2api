@@ -1,9 +1,10 @@
 "use client";
 
-import { Globe, LoaderCircle, Save } from "lucide-react";
+import { Globe, Save } from "lucide-react";
 
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
+import { ApiLoadingMark } from "@/components/api-loading-mark";
 import { Card, CardContent } from "@/components/ui/card";
 import { Input } from "@/components/ui/input";
 
@@ -38,7 +39,7 @@ export function BaseUrlCard() {
 
         {isLoadingConfig ? (
           <div className="flex items-center justify-center py-10">
-            <LoaderCircle className="size-5 animate-spin text-stone-400" />
+            <ApiLoadingMark size="section" label="正在加载基础配置" />
           </div>
         ) : (
           <>
@@ -59,7 +60,7 @@ export function BaseUrlCard() {
                 onClick={() => void saveConfig()}
                 disabled={isSavingConfig}
               >
-                {isSavingConfig ? <LoaderCircle className="size-4 animate-spin" /> : <Save className="size-4" />}
+                {isSavingConfig ? <ApiLoadingMark size="inline" label="正在保存基础配置" /> : <Save className="size-4" />}
                 保存配置
               </Button>
             </div>

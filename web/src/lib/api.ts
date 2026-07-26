@@ -302,7 +302,7 @@ export type ManagedImage = {
   owner_name?: string;
   visibility: ImageVisibility;
   prompt?: string;
-  model?: ImageModel;
+  model?: string;
   quality?: ImageQuality;
   date: string;
   size: number;
@@ -335,6 +335,126 @@ export type ManagedImage = {
   megapixels?: number;
   created_at: string;
   published_at?: string;
+  source?: "creation" | "external_api";
+  provider_id?: string;
+  provider_name?: string;
+  protocol?: ExternalImageProtocol;
+  revised_prompt?: string;
+};
+
+export type ExternalImageProtocol = "openai_images" | "openai_image_edits" | "openai_chat_images";
+export type ExternalChatProtocol = "openai_chat";
+
+export type ExternalImageProvider = {
+  id: string;
+  name: string;
+  enabled: boolean;
+  sort_order?: number;
+	image_enabled: boolean;
+	chat_enabled: boolean;
+  protocol: ExternalImageProtocol | "";
+  models: string[];
+  default_model: string;
+  default_size?: string;
+  default_quality?: string;
+  max_images?: number;
+  max_reference_images?: number;
+  base_url?: string;
+  has_api_key?: boolean;
+  temperature?: number;
+  timeout_seconds?: number;
+  concurrency_limit?: number;
+	chat_protocol?: ExternalChatProtocol;
+	chat_models: string[];
+	chat_default_model?: string;
+	chat_temperature?: number | null;
+	chat_concurrency_limit?: number;
+  created_at?: string;
+  updated_at?: string;
+};
+
+export type ExternalImageProviderInput = {
+  name: string;
+  enabled: boolean;
+  sort_order: number;
+	image_enabled: boolean;
+	chat_enabled: boolean;
+  protocol: ExternalImageProtocol;
+	chat_protocol: ExternalChatProtocol;
+  base_url: string;
+  api_key?: string;
+  models: string[];
+  default_model: string;
+  default_size: string;
+  default_quality: string;
+  temperature: number;
+  max_images: number;
+  max_reference_images: number;
+  timeout_seconds: number;
+  concurrency_limit: number;
+	chat_models: string[];
+	chat_default_model: string;
+	chat_temperature: number | null;
+	chat_concurrency_limit: number;
+};
+
+export type ExternalImageSettings = {
+  user_concurrent_limit: number;
+  user_rpm_limit: number;
+	chat_user_concurrent_limit: number;
+	chat_user_rpm_limit: number;
+};
+
+export type ExternalChatProvider = {
+	id: string;
+	name: string;
+	protocol: ExternalChatProtocol;
+	models: string[];
+	default_model: string;
+	temperature?: number | null;
+};
+
+export type ExternalImageTask = {
+  id: string;
+  owner_id?: string;
+  owner_name?: string;
+  provider_id: string;
+  provider_name: string;
+  protocol: ExternalImageProtocol;
+  model: string;
+  prompt: string;
+  n: number;
+  size?: string;
+  aspect_ratio?: string;
+  quality?: string;
+  temperature?: number;
+  status: "queued" | "running" | "success" | "error" | "cancelled";
+  data?: ManagedImage[];
+  references?: Array<{ index: number; name: string; content_type: string; url: string }>;
+  retry_of?: string;
+  error?: string;
+  error_detail?: string;
+  error_code?: string;
+  upstream_status?: number;
+  request_id?: string;
+  retryable?: boolean;
+  created_at: string;
+  updated_at: string;
+  started_at?: string;
+  finished_at?: string;
+};
+
+export type ExternalImageSubmission = {
+  clientTaskId: string;
+  providerId: string;
+  model: string;
+  prompt: string;
+  count: number;
+  size?: string;
+  aspectRatio?: string;
+  quality?: string;
+  temperature?: number;
+  references?: File[];
 };
 
 export type SystemLog = {
@@ -502,7 +622,6 @@ type CreationTaskListResponse = {
 export type LoginResponse = {
   ok: boolean;
   version: string;
-  token?: string;
   role: AuthRole;
   role_id?: string;
   role_name?: string;
@@ -708,44 +827,6 @@ export type CreateManagedUserPayload = {
   enabled?: boolean;
 };
 
-export type RegisterConfig = {
-  enabled: boolean;
-  mail: {
-    request_timeout: number;
-    wait_timeout: number;
-    wait_interval: number;
-    providers: Array<Record<string, unknown>>;
-  };
-  proxy: string;
-  total: number;
-  threads: number;
-  mode: "total" | "quota" | "available";
-  target_quota: number;
-  target_available: number;
-  check_interval: number;
-  stats: {
-    job_id?: string;
-    success: number;
-    fail: number;
-    done: number;
-    running: number;
-    threads: number;
-    elapsed_seconds?: number;
-    avg_seconds?: number;
-    success_rate?: number;
-    current_quota?: number;
-    current_available?: number;
-    started_at?: string;
-    updated_at?: string;
-    finished_at?: string;
-  };
-  logs?: Array<{
-    time: string;
-    text: string;
-    level: string;
-  }>;
-};
-
 export async function login(username: string, password: string) {
   return httpRequest<LoginResponse>("/auth/login", {
     method: "POST",
@@ -762,12 +843,9 @@ export async function registerAccount(username: string, password: string, name?:
   });
 }
 
-export async function verifySession(token: string) {
+export async function verifySession() {
   return httpRequest<LoginResponse>("/auth/session", {
     method: "GET",
-    headers: {
-      Authorization: `Bearer ${String(token || "").trim()}`,
-    },
     redirectOnUnauthorized: false,
   });
 }
@@ -1351,7 +1429,7 @@ export async function updateProfileName(name: string) {
 }
 
 export async function changeProfilePassword(currentPassword: string, newPassword: string) {
-  return httpRequest<{ ok: boolean }>("/api/profile/password", {
+  return httpRequest<LoginResponse>("/api/profile/password", {
     method: "POST",
     body: {
       current_password: currentPassword,
@@ -1492,29 +1570,6 @@ export async function deleteManagedUser(userId: string) {
   return httpRequest<{ items?: ManagedUser[] } & Partial<ManagedUsersResponse>>(managedUserPath(userId), {
     method: "DELETE",
   });
-}
-
-export async function fetchRegisterConfig() {
-  return httpRequest<{ register: RegisterConfig }>("/api/register");
-}
-
-export async function updateRegisterConfig(updates: Partial<RegisterConfig>) {
-  return httpRequest<{ register: RegisterConfig }>("/api/register", {
-    method: "POST",
-    body: updates,
-  });
-}
-
-export async function startRegister() {
-  return httpRequest<{ register: RegisterConfig }>("/api/register/start", { method: "POST" });
-}
-
-export async function stopRegister() {
-  return httpRequest<{ register: RegisterConfig }>("/api/register/stop", { method: "POST" });
-}
-
-export async function resetRegister() {
-  return httpRequest<{ register: RegisterConfig }>("/api/register/reset", { method: "POST" });
 }
 
 // ── CPA (CLIProxyAPI) ──────────────────────────────────────────────

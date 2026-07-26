@@ -2,14 +2,91 @@
 <html lang="zh-CN">
   <head>
     <meta charset="UTF-8" />
-    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
-    <meta name="description" content="ChatGPT account pool management dashboard" />
-    <link rel="icon" type="image/svg+xml" href="/logo-mark.svg?v=20260508" />
-    <link rel="icon" href="/favicon.ico?v=20260508" sizes="any" />
-    <title>ChatGptImage</title>
+    <meta name="viewport" content="width=device-width, initial-scale=1.0, viewport-fit=cover" />
+    <meta name="description" content="Multi-model AI creation, chat, and API management workspace" />
+    <meta name="application-name" content="Prism AI Studio" />
+    <meta name="theme-color" content="#f6f8fc" media="(prefers-color-scheme: light)" />
+    <meta name="theme-color" content="#171717" media="(prefers-color-scheme: dark)" />
+    <meta name="mobile-web-app-capable" content="yes" />
+    <meta name="apple-mobile-web-app-capable" content="yes" />
+    <meta name="apple-mobile-web-app-status-bar-style" content="default" />
+    <meta name="apple-mobile-web-app-title" content="Prism AI" />
+    <link rel="manifest" href="/manifest.webmanifest?v=20260719-3" />
+    <link rel="apple-touch-icon" sizes="180x180" href="/apple-touch-icon.png?v=20260719-3" />
+    <link rel="icon" type="image/png" sizes="192x192" href="/pwa-icon-192.png?v=20260719-3" />
+    <title>Prism AI Studio</title>
+    <style>
+      html,
+      body,
+      #root {
+        min-height: 100%;
+        margin: 0;
+      }
+
+      body {
+        background: #f6f8fc;
+      }
+
+      #pwa-boot {
+        position: fixed;
+        inset: 0;
+        z-index: 9999;
+        display: flex;
+        align-items: center;
+        justify-content: center;
+        background: #f6f8fc;
+      }
+
+      #pwa-boot-stage {
+        display: inline-flex;
+        align-items: center;
+        justify-content: center;
+        gap: 6.72px;
+        transform: skewX(-11deg);
+      }
+
+      #pwa-boot-stage span {
+        width: 10.4px;
+        height: 40.8px;
+        border-radius: 4.48px;
+        transform-origin: center;
+        animation: api-loading-segment 1.05s cubic-bezier(0.22, 1, 0.36, 1) infinite;
+      }
+
+      #pwa-boot-stage span:nth-child(1) { background: #181e25; animation-delay: -0.2s; }
+      #pwa-boot-stage span:nth-child(2) { background: linear-gradient(180deg, #3daeff, #1456f0); box-shadow: 0 3px 10px rgb(20 86 240 / 25%); animation-delay: -0.1s; }
+      #pwa-boot-stage span:nth-child(3) { background: linear-gradient(180deg, #ff786d, #ea5ec1); box-shadow: 0 3px 10px rgb(234 94 193 / 22%); }
+
+      @media (prefers-color-scheme: dark) {
+        body,
+        #pwa-boot {
+          background: #171717;
+        }
+
+        #pwa-boot-stage span:nth-child(1) {
+          background: #f4f4f5;
+        }
+      }
+
+      @media (prefers-reduced-motion: reduce) {
+        #pwa-boot-stage span {
+          animation: none;
+          opacity: 0.78;
+        }
+      }
+
+      @keyframes api-loading-segment {
+        0%, 100% { transform: translateY(3px) scaleY(0.68); opacity: 0.48; }
+        45% { transform: translateY(-2px) scaleY(1.08); opacity: 1; }
+      }
+    </style>
   </head>
   <body>
-    <div id="root"></div>
+    <div id="root">
+      <div id="pwa-boot" role="status" aria-label="正在加载">
+        <span id="pwa-boot-stage" aria-hidden="true"><span></span><span></span><span></span></span>
+      </div>
+    </div>
     <script type="module" src="/src/main.tsx"></script>
   </body>
 </html>

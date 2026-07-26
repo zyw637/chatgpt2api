@@ -1,7 +1,7 @@
 "use client";
 
 import { useCallback, useEffect, useMemo, useRef, useState, type CSSProperties } from "react";
-import { Globe2, History, ImagePlus, LoaderCircle, Plus, Trash2, X } from "lucide-react";
+import { Globe2, History, ImagePlus, Plus, Trash2, X } from "lucide-react";
 import { toast } from "sonner";
 
 import { ImageComposer } from "@/app/image/components/image-composer";
@@ -33,6 +33,8 @@ import {
 import { IMAGE_PROMPT_PRESETS, type ImagePromptPreset } from "@/app/image/image-presets";
 import { consumeSimilarImageIntent } from "@/app/image/similar-image-intent";
 import { ImageSidebar } from "@/app/image/components/image-sidebar";
+import { AuthenticatedImage } from "@/components/authenticated-image";
+import { ApiLoadingMark } from "@/components/api-loading-mark";
 import { ImageLightbox } from "@/components/image-lightbox";
 import { Button } from "@/components/ui/button";
 import { Checkbox } from "@/components/ui/checkbox";
@@ -87,6 +89,8 @@ import { fetchAuthenticatedImageBlob } from "@/lib/authenticated-image";
 import { clearImageManagerCache } from "@/lib/image-manager-cache";
 import { getManagedImagePathFromUrl } from "@/lib/image-path";
 import { authSessionFromLoginResponse, setVerifiedAuthSession } from "@/lib/session";
+import { subscribeHistoryChange, useHistoryResumeSync } from "@/lib/history-sync";
+import { compareHistoryTimes } from "@/lib/history-document";
 import { cn } from "@/lib/utils";
 import { useAuthGuard } from "@/lib/use-auth-guard";
 import {
@@ -97,7 +101,12 @@ import {
   getImageTurnLoadingCounts,
   IMAGE_ACTIVE_CONVERSATION_REQUEST_EVENT,
   IMAGE_CONVERSATIONS_CHANGED_EVENT,
+  deriveImageTurnStatus,
   listImageConversations,
+  preferMonotonicImageTaskStatus,
+  preserveInFlightConversations,
+  pullImageConversationsRemote,
+  pushImageConversationsRemote,
   saveImageConversation,
   saveImageConversations,
   type ImageConversation,
@@ -107,6 +116,7 @@ import {
   type StoredImageSizeSelection,
   type StoredImage,
   type StoredReferenceImage,
+  resolveReferenceImageSrc,
 } from "@/store/image-conversations";
 import {
   clearImageTurnProgress,
@@ -134,6 +144,40 @@ const DEFAULT_IMAGE_OUTPUT_FORMAT: ImageOutputFormat = "png";
 const activeConversationQueueIds = new Set<string>();
 const EMPTY_IMAGE_ASPECT_RATIO_SELECT_VALUE = "__empty_aspect_ratio__";
 const MISSING_RECOVERABLE_TASK_ID_ERROR = "页面刷新或任务中断，未找到可恢复的任务 ID";
+/** Coalesce high-frequency poll progress writes to localforage. */
+const LOCAL_PERSIST_THROTTLE_MS = 1500;
+
+function stampChangedImageTurns(
+  current: ImageConversation | null,
+  next: ImageConversation,
+): ImageConversation {
+  const currentTurns = new Map((current?.turns || []).map((turn) => [turn.id, turn]));
+  let conversationUpdatedAt = next.updatedAt;
+  const turns = next.turns.map((turn) => {
+    const previous = currentTurns.get(turn.id);
+    if (!previous) {
+      return turn.updatedAt ? turn : { ...turn, updatedAt: turn.createdAt };
+    }
+    if (turn === previous) {
+      return turn;
+    }
+    const previousTime = Date.parse(previous.updatedAt || previous.createdAt);
+    const candidateTime = Date.parse(next.updatedAt);
+    const updatedAt =
+      Number.isFinite(previousTime) && (!Number.isFinite(candidateTime) || candidateTime <= previousTime)
+        ? new Date(previousTime + 1).toISOString()
+        : next.updatedAt;
+    if (Date.parse(updatedAt) > Date.parse(conversationUpdatedAt)) {
+      conversationUpdatedAt = updatedAt;
+    }
+    return { ...turn, updatedAt };
+  });
+  return {
+    ...next,
+    updatedAt: conversationUpdatedAt,
+    turns,
+  };
+}
 
 type ComposerMode = "chat" | "image";
 
@@ -217,6 +261,17 @@ function dataUrlToFile(dataUrl: string, fileName: string, mimeType?: string) {
   return new File([bytes], fileName, { type: mimeType || matchedMimeType || "image/png" });
 }
 
+async function referenceImageToFile(image: StoredReferenceImage, fileName: string) {
+  if (image.dataUrl) {
+    return dataUrlToFile(image.dataUrl, fileName, image.type);
+  }
+  const src = resolveReferenceImageSrc(image);
+  if (!src) {
+    throw new Error(`参考图不可用: ${image.name || fileName}`);
+  }
+  return fetchImageAsFile(src, fileName);
+}
+
 function imageFileExtensionForOutputFormat(format?: ImageOutputFormat) {
   return format === "jpeg" ? "jpg" : format || "png";
 }
@@ -226,15 +281,25 @@ function imageMimeTypeForOutputFormat(format?: ImageOutputFormat) {
 }
 
 function buildReferenceImageFromResult(image: StoredImage, fileName: string): StoredReferenceImage | null {
+  const mimeType = imageMimeTypeForOutputFormat(image.outputFormat);
+  // Prefer durable url/path so conversation history stays small.
+  if (image.url || image.path) {
+    return {
+      name: fileName,
+      type: mimeType,
+      ...(image.url ? { url: image.url } : {}),
+      ...(image.path ? { path: image.path } : {}),
+      source: "conversation",
+    };
+  }
   if (!image.b64_json) {
     return null;
   }
-  const mimeType = imageMimeTypeForOutputFormat(image.outputFormat);
-
   return {
     name: fileName,
     type: mimeType,
     dataUrl: `data:${mimeType};base64,${image.b64_json}`,
+    source: "conversation",
   };
 }
 
@@ -291,21 +356,28 @@ function reusableOutputCompressionValue(value: unknown, outputFormat: ImageOutpu
 async function buildReferenceImageFromStoredImage(image: StoredImage, fileName: string) {
   const direct = buildReferenceImageFromResult(image, fileName);
   if (direct) {
+    // Do not eagerly expand url/path into multi-MB dataUrl for history.
+    const file = direct.dataUrl
+      ? dataUrlToFile(direct.dataUrl, direct.name, direct.type)
+      : await referenceImageToFile(direct, fileName);
     return {
       referenceImage: direct,
-      file: dataUrlToFile(direct.dataUrl, direct.name, direct.type),
+      file,
     };
   }
 
-  if (!image.url) {
+  if (!image.url && !image.path) {
     return null;
   }
-  const file = await fetchImageAsFile(image.url, fileName);
+  const src = image.url || resolveReferenceImageSrc({ path: image.path });
+  const file = await fetchImageAsFile(src, fileName);
   return {
     referenceImage: {
       name: file.name,
       type: file.type || "image/png",
-      dataUrl: await readFileAsDataUrl(file),
+      ...(image.url ? { url: image.url } : {}),
+      ...(image.path ? { path: image.path } : {}),
+      source: "conversation" as const,
     },
     file,
   };
@@ -390,19 +462,19 @@ function imageTaskProgressMessage(turn: ImageTurn, elapsedSeconds = 0) {
   if (turn.status === "queued") {
     return turn.mode === "chat"
       ? {
-          message: "等待创作并发额度",
-          detail: "对话任务已入队，等待可用额度",
+          message: "任务已提交",
+          detail: "对话任务已入队，准备开始处理",
         }
       : {
-          message: "等待创作并发额度",
-          detail: "图片任务已入队，等待可用额度",
+          message: "任务已提交",
+          detail: "图片任务已入队，准备开始生成",
         };
   }
 
   if (turn.mode === "chat") {
     return {
-      message: "等待对话回复",
-      detail: "对话任务处理中",
+      message: "对话处理中",
+      detail: "正在请求上游并等待回复",
     };
   }
 
@@ -416,8 +488,8 @@ function imageTaskProgressMessage(turn: ImageTurn, elapsedSeconds = 0) {
     };
   }
   return {
-    message: route ? `${route.routeLabel}生成中` : "等待生成结果",
-    detail: "后端正在轮询任务状态",
+    message: route ? `${route.routeLabel}生成中` : "生成处理中",
+    detail: "后端正在请求上游并等待结果",
   };
 }
 
@@ -426,11 +498,17 @@ function imageTaskLoadingDetail(turn: ImageTurn, fallbackDetail: string) {
   if (turn.mode === "chat") {
     return fallbackDetail;
   }
-  if (counts.queued > 0) {
-    return `${fallbackDetail}；还有 ${counts.queued} 张图片排队中`;
+  // Prefer "processing" wording when anything is running, even if other
+  // slots are still queued — otherwise multi-image turns look like they
+  // bounced back into a queue.
+  if (counts.running > 0 && counts.queued > 0) {
+    return `${fallbackDetail}；${counts.running} 张处理中，${counts.queued} 张待处理`;
   }
   if (counts.running > 0) {
     return `${fallbackDetail}；还有 ${counts.running} 张图片处理中`;
+  }
+  if (counts.queued > 0) {
+    return `${fallbackDetail}；还有 ${counts.queued} 张图片待处理`;
   }
   return "图片结果已返回，正在确认任务状态";
 }
@@ -474,18 +552,52 @@ function updateStoredImage(image: StoredImage, updates: Partial<StoredImage>): S
   return STORED_IMAGE_FIELDS.every((field) => image[field] === next[field]) ? image : next;
 }
 
-function creationTaskImageStatus(task: CreationTask, dataIndex = 0): "queued" | "running" | "success" | "error" | "cancelled" | undefined {
+function creationTaskImageStatus(
+  task: CreationTask,
+  dataIndex = 0,
+  previousTaskStatus?: StoredImage["taskStatus"],
+  preferProcessing = false,
+): "queued" | "running" | "success" | "error" | "cancelled" | undefined {
   const outputStatus = task.output_statuses?.[dataIndex];
-  if (outputStatus === "queued" || outputStatus === "running" || outputStatus === "success" || outputStatus === "error" || outputStatus === "cancelled") {
-    return outputStatus;
+  let mapped: StoredImage["taskStatus"] | undefined;
+  if (outputStatus === "running" || outputStatus === "success" || outputStatus === "error" || outputStatus === "cancelled") {
+    mapped = outputStatus;
+  } else if (outputStatus === "queued") {
+    mapped = "queued";
+  } else if (
+    task.status === "queued" ||
+    task.status === "running" ||
+    task.status === "success" ||
+    task.status === "error" ||
+    task.status === "cancelled"
+  ) {
+    // When per-image output_statuses is missing, fall back to task status.
+    // task=running without a slot status means the worker is up but this slot
+    // has not been acquired yet → keep as queued for concurrency detail.
+    mapped = task.status === "running" ? "queued" : task.status;
   }
-  if (task.status === "queued" || task.status === "running" || task.status === "success" || task.status === "error" || task.status === "cancelled") {
-    return task.status;
+
+  // After the frontend has already started a turn, treat a still-queued *task*
+  // (submit just returned / worker not yet marked running) as processing so
+  // submit→poll does not flash "排队中". Keep per-slot "queued" when the task
+  // is already running — that means waiting on a creation-unit slot.
+  if (preferProcessing && (mapped === "queued" || mapped == null) && task.status === "queued") {
+    mapped = "running";
   }
-  return undefined;
+
+  return preferMonotonicImageTaskStatus(previousTaskStatus, mapped, {
+    // When overall task is running, slot-level queued is real concurrency wait.
+    allowRunningToQueued: task.status === "running" && mapped === "queued",
+  });
 }
 
-function taskDataToStoredImage(image: StoredImage, task: CreationTask, dataIndex = 0, fallbackVisibility?: ImageVisibility): StoredImage {
+function taskDataToStoredImage(
+  image: StoredImage,
+  task: CreationTask,
+  dataIndex = 0,
+  fallbackVisibility?: ImageVisibility,
+  preferProcessing = false,
+): StoredImage {
   const taskVisibility = task.visibility || fallbackVisibility || image.visibility || "private";
   const successUpdates = (item: CreationTaskDataItem) => {
     const width = positiveDimension(item.width);
@@ -525,7 +637,7 @@ function taskDataToStoredImage(image: StoredImage, task: CreationTask, dataIndex
     const item = task.data?.[dataIndex];
     if (!item?.b64_json && !item?.url) {
       if (dataIndex > 0 && image.taskId !== image.id) {
-        const slotStatus = creationTaskImageStatus(task, dataIndex);
+        const slotStatus = creationTaskImageStatus(task, dataIndex, image.taskStatus, preferProcessing);
         if (slotStatus === "error" || slotStatus === "cancelled") {
           return updateStoredImage(image, {
             taskId: task.id,
@@ -536,7 +648,7 @@ function taskDataToStoredImage(image: StoredImage, task: CreationTask, dataIndex
         }
         return updateStoredImage(image, {
           taskId: image.id,
-          taskStatus: "queued",
+          taskStatus: preferMonotonicImageTaskStatus(image.taskStatus, "queued") || "queued",
           status: "loading",
           error: undefined,
         });
@@ -556,9 +668,16 @@ function taskDataToStoredImage(image: StoredImage, task: CreationTask, dataIndex
     if (item?.b64_json || item?.url) {
       return updateStoredImage(image, successUpdates(item));
     }
+    const nextTaskStatus =
+      creationTaskImageStatus(task, dataIndex, image.taskStatus, preferProcessing) ||
+      (task.status === "running"
+        ? "queued" // overall running but this slot not yet acquired
+        : preferProcessing
+          ? "running"
+          : "queued");
     return updateStoredImage(image, {
       taskId: task.id,
-      taskStatus: creationTaskImageStatus(task, dataIndex) || (task.status === "queued" ? "queued" : "running"),
+      taskStatus: nextTaskStatus,
       status: "loading",
       text_response: undefined,
       error: undefined,
@@ -608,7 +727,7 @@ function taskDataToStoredImage(image: StoredImage, task: CreationTask, dataIndex
 
   return updateStoredImage(image, {
     taskId: task.id,
-    taskStatus: creationTaskImageStatus(task, dataIndex) || "queued",
+    taskStatus: creationTaskImageStatus(task, dataIndex, image.taskStatus, preferProcessing) || "queued",
     status: "loading",
     text_response: undefined,
     error: undefined,
@@ -631,7 +750,7 @@ function pickFallbackConversationId(conversations: ImageConversation[]) {
 }
 
 function sortImageConversations(conversations: ImageConversation[]) {
-  return [...conversations].sort((a, b) => b.updatedAt.localeCompare(a.updatedAt));
+  return [...conversations].sort((a, b) => compareHistoryTimes(b.updatedAt, a.updatedAt));
 }
 
 function getStoredImageModel(): ImageModel {
@@ -715,17 +834,6 @@ function restoreImageSizeSelection(stored: StoredImageSizeSelection | undefined,
   };
 }
 
-function buildTurnOutcomeMessage(successCount: number, failedCount: number, cancelledCount: number) {
-  const parts = [`成功 ${successCount} 张`];
-  if (failedCount > 0) {
-    parts.push(`失败 ${failedCount} 张`);
-  }
-  if (cancelledCount > 0) {
-    parts.push(`终止 ${cancelledCount} 张`);
-  }
-  return parts.join("，");
-}
-
 function formatCreationTaskErrorMessage(message: string) {
   const trimmed = String(message || "").trim();
   if (!trimmed) {
@@ -786,34 +894,11 @@ function hasEnoughBilling(session: NonNullable<ReturnType<typeof useAuthGuard>["
 }
 
 function deriveTurnStatus(turn: ImageTurn): Pick<ImageTurn, "status" | "error"> {
-  const loadingCounts = getImageTurnLoadingCounts(turn);
-  const failedCount = turn.images.filter((image) => image.status === "error").length;
-  const successCount = turn.images.filter((image) => image.status === "success").length;
-  const cancelledCount = turn.images.filter((image) => image.status === "cancelled").length;
-  const messageCount = turn.images.filter((image) => image.status === "message").length;
-  if (loadingCounts.running > 0) {
-    return { status: "generating", error: undefined };
-  }
-  if (loadingCounts.queued > 0) {
-    return { status: "queued", error: undefined };
-  }
-  if (failedCount > 0) {
-    return { status: "error", error: buildTurnOutcomeMessage(successCount, failedCount, cancelledCount) };
-  }
-  if (cancelledCount > 0) {
-    return { status: "cancelled", error: buildTurnOutcomeMessage(successCount, failedCount, cancelledCount) };
-  }
-  if (successCount > 0) {
-    return { status: "success", error: undefined };
-  }
-  if (messageCount > 0) {
-    return { status: "message", error: undefined };
-  }
-  return { status: "queued", error: undefined };
+  return deriveImageTurnStatus(turn);
 }
 
 function deriveTurnStatusFromTaskMap(turn: ImageTurn, images: StoredImage[]): Pick<ImageTurn, "status" | "error"> {
-  return deriveTurnStatus({ ...turn, images });
+  return deriveImageTurnStatus({ ...turn, images });
 }
 
 function isTurnInProgress(turn: ImageTurn) {
@@ -924,7 +1009,7 @@ async function syncConversationCreationTasks(items: ImageConversation[]) {
   const taskMap = new Map(taskList.items.map((task) => [task.id, task]));
   let changed = false;
   const normalized = items.map((conversation) => {
-    let completedActiveTurn = false;
+    const updatedAt = new Date().toISOString();
     const turns = conversation.turns.map((turn) => {
       let turnChanged = false;
       const images = turn.images.map((image, imageIndex) => {
@@ -935,7 +1020,13 @@ async function syncConversationCreationTasks(items: ImageConversation[]) {
         if (!task) {
           return image;
         }
-        const nextImage = taskDataToStoredImage(image, task, imageDataIndexForTask(turn.images, imageIndex), turn.visibility);
+        const nextImage = taskDataToStoredImage(
+          image,
+          task,
+          imageDataIndexForTask(turn.images, imageIndex),
+          turn.visibility,
+          turn.status === "generating" || Boolean(turn.processingStartedAt),
+        );
         if (nextImage !== image) {
           turnChanged = true;
         }
@@ -946,29 +1037,22 @@ async function syncConversationCreationTasks(items: ImageConversation[]) {
       }
       changed = true;
       const derived = deriveTurnStatusFromTaskMap(turn, images);
-      const nextTurn = {
+      return {
         ...turn,
         ...derived,
         images,
+        updatedAt,
       };
-      if (isTurnInProgress(turn) && !isTurnInProgress(nextTurn)) {
-        completedActiveTurn = true;
-      }
-      return nextTurn;
     });
     if (turns === conversation.turns || !turns.some((turn, index) => turn !== conversation.turns[index])) {
       return conversation;
     }
-    const nextConversation = {
+    return {
       ...conversation,
       turns,
+      // Progress and terminal updates both bump updatedAt so stale history sync cannot win.
+      updatedAt,
     };
-    return completedActiveTurn
-      ? {
-          ...nextConversation,
-          updatedAt: new Date().toISOString(),
-        }
-      : nextConversation;
   });
 
   if (changed) {
@@ -980,6 +1064,7 @@ async function syncConversationCreationTasks(items: ImageConversation[]) {
 async function recoverConversationHistory(items: ImageConversation[]) {
   let changed = false;
   const normalized = items.map((conversation) => {
+    const updatedAt = new Date().toISOString();
     const turns = conversation.turns.map((turn) => {
       let turnChanged = false;
       const recoveredImages = turn.images.map((image, imageIndex) => {
@@ -1021,6 +1106,7 @@ async function recoverConversationHistory(items: ImageConversation[]) {
           ...turn,
           ...derived,
           images: recoveredImages,
+          updatedAt,
         };
       }
 
@@ -1044,6 +1130,7 @@ async function recoverConversationHistory(items: ImageConversation[]) {
         ...turn,
         ...derived,
         images,
+        updatedAt,
       };
     });
 
@@ -1054,7 +1141,7 @@ async function recoverConversationHistory(items: ImageConversation[]) {
     return {
       ...conversation,
       turns,
-      updatedAt: new Date().toISOString(),
+      updatedAt,
     };
   });
 
@@ -1109,6 +1196,17 @@ function ImagePageContent({ session }: { session: NonNullable<ReturnType<typeof 
   const [progressNow, setProgressNow] = useState(Date.now());
   const [composerDockHeight, setComposerDockHeight] = useState(0);
   const [visibilityMutatingImageKey, setVisibilityMutatingImageKey] = useState("");
+  const localPersistStateRef = useRef<{
+    pendingIds: Set<string>;
+    timer: number | null;
+    lastFlushAt: number;
+    flushChain: Promise<void>;
+  }>({
+    pendingIds: new Set(),
+    timer: null,
+    lastFlushAt: 0,
+    flushChain: Promise.resolve(),
+  });
   const [publishImageTarget, setPublishImageTarget] = useState<PublishImageTarget | null>(null);
   const [publishRecipeOptions, setPublishRecipeOptions] = useState<PublishRecipeOptions>({
     sharePromptParameters: false,
@@ -1262,8 +1360,11 @@ function ImagePageContent({ session }: { session: NonNullable<ReturnType<typeof 
         if (cancelled) {
           return;
         }
-        conversationsRef.current = items;
-        setConversations(items);
+        // Prefer in-flight memory state over a lagging disk snapshot written by
+        // a previous progress save / remote history merge.
+        const merged = preserveInFlightConversations(items, conversationsRef.current);
+        conversationsRef.current = merged;
+        setConversations(merged);
       } catch {
         // Background updates should not surface noisy toasts while the user is on another workflow.
       }
@@ -1273,10 +1374,40 @@ function ImagePageContent({ session }: { session: NonNullable<ReturnType<typeof 
       void refreshConversations();
     };
 
-    window.addEventListener(IMAGE_CONVERSATIONS_CHANGED_EVENT, handleConversationsChanged);
+	const unsubscribe = subscribeHistoryChange(IMAGE_CONVERSATIONS_CHANGED_EVENT, handleConversationsChanged);
+	return () => {
+		cancelled = true;
+		unsubscribe();
+	};
+  }, []);
+
+  // Flush coalesced progress writes on unmount so a mid-poll navigation does not drop state.
+  useEffect(() => {
+    const persistState = localPersistStateRef.current;
     return () => {
-      cancelled = true;
-      window.removeEventListener(IMAGE_CONVERSATIONS_CHANGED_EVENT, handleConversationsChanged);
+      const state = persistState;
+      if (state.timer != null) {
+        window.clearTimeout(state.timer);
+        state.timer = null;
+      }
+      const ids = Array.from(state.pendingIds);
+      state.pendingIds.clear();
+      if (ids.length === 0) {
+        return;
+      }
+      // Fire-and-forget: component is unmounting; still best-effort durable write.
+      void (async () => {
+        for (const id of ids) {
+          const conversation = conversationsRef.current.find((item) => item.id === id);
+          if (conversation) {
+            try {
+              await saveImageConversation(conversation);
+            } catch {
+              // Best-effort on unmount.
+            }
+          }
+        }
+      })();
     };
   }, []);
 
@@ -1305,6 +1436,28 @@ function ImagePageContent({ session }: { session: NonNullable<ReturnType<typeof 
   useEffect(() => {
     let cancelled = false;
 
+    const applyHistoryItems = (
+      items: ImageConversation[],
+      options: { preferSelection?: boolean } = {},
+    ) => {
+      conversationsRef.current = items;
+      setConversations(items);
+      setSelectedConversationId((current) => {
+        if (!options.preferSelection && current && items.some((item) => item.id === current)) {
+          return current;
+        }
+        const storedConversationId =
+          typeof window !== "undefined" ? window.localStorage.getItem(ACTIVE_IMAGE_CONVERSATION_STORAGE_KEY) : null;
+        return (
+          (storedConversationId && items.some((conversation) => conversation.id === storedConversationId)
+            ? storedConversationId
+            : null) ??
+          (current && items.some((item) => item.id === current) ? current : null) ??
+          pickFallbackConversationId(items)
+        );
+      });
+    };
+
     const loadHistory = async () => {
       try {
         const storedSelection = getStoredImageSizeSelection();
@@ -1317,24 +1470,33 @@ function ImagePageContent({ session }: { session: NonNullable<ReturnType<typeof 
         setImageOutputFormat(getStoredImageOutputFormat());
         setImageOutputCompression(getStoredImageOutputCompression());
 
-        const items = await listImageConversations();
-        const normalizedItems = await recoverConversationHistory(items);
-        if (cancelled) {
-          return;
+        // Cloud history is authoritative. Only read the local cache when the cloud is unavailable.
+        try {
+          const pulled = await pullImageConversationsRemote();
+          if (cancelled) {
+            return;
+          }
+          const pulledNormalized = await recoverConversationHistory(pulled);
+          if (cancelled) {
+            return;
+          }
+          applyHistoryItems(pulledNormalized, { preferSelection: true });
+        } catch {
+          if (!cancelled) {
+            const localItems = await listImageConversations();
+            const localNormalized = await recoverConversationHistory(localItems);
+            if (cancelled) {
+              return;
+            }
+            applyHistoryItems(localNormalized, { preferSelection: true });
+            toast.warning("云端历史同步较慢或暂不可用，已继续使用本机记录");
+          }
         }
-
-        conversationsRef.current = normalizedItems;
-        setConversations(normalizedItems);
-        const storedConversationId =
-          typeof window !== "undefined" ? window.localStorage.getItem(ACTIVE_IMAGE_CONVERSATION_STORAGE_KEY) : null;
-        const nextSelectedConversationId =
-          (storedConversationId && normalizedItems.some((conversation) => conversation.id === storedConversationId)
-            ? storedConversationId
-            : null) ?? pickFallbackConversationId(normalizedItems);
-        setSelectedConversationId(nextSelectedConversationId);
       } catch (error) {
         const message = error instanceof Error ? error.message : "读取会话记录失败";
-        toast.error(message);
+        if (!cancelled) {
+          toast.error(message);
+        }
       } finally {
         if (!cancelled) {
           setIsLoadingHistory(false);
@@ -1347,6 +1509,32 @@ function ImagePageContent({ session }: { session: NonNullable<ReturnType<typeof 
       cancelled = true;
     };
   }, []);
+
+  useHistoryResumeSync(async () => {
+    try {
+      const pulled = await pullImageConversationsRemote();
+      const pulledNormalized = await recoverConversationHistory(pulled);
+      // An active task may be ahead of its last cloud snapshot until the next terminal write.
+      const merged = preserveInFlightConversations(pulledNormalized, conversationsRef.current);
+      conversationsRef.current = merged;
+      setConversations(merged);
+      // Keep selection coherent when a remote delete removed the active conversation.
+      setSelectedConversationId((current) => {
+        if (current && merged.some((item) => item.id === current)) {
+          return current;
+        }
+        const storedConversationId =
+          typeof window !== "undefined" ? window.localStorage.getItem(ACTIVE_IMAGE_CONVERSATION_STORAGE_KEY) : null;
+        return (
+          (storedConversationId && merged.some((item) => item.id === storedConversationId)
+            ? storedConversationId
+            : null) ?? pickFallbackConversationId(merged)
+        );
+      });
+    } catch {
+      // Resume sync is best-effort; local list stays usable offline.
+    }
+  }, !isLoadingHistory);
 
   useEffect(() => {
     if (isLoadingHistory || similarIntentAppliedRef.current) {
@@ -1535,6 +1723,48 @@ function ImagePageContent({ session }: { session: NonNullable<ReturnType<typeof 
     }
   }, [conversations, selectedConversationId]);
 
+  const flushPendingLocalPersists = useCallback(async () => {
+    const state = localPersistStateRef.current;
+    if (state.timer != null) {
+      window.clearTimeout(state.timer);
+      state.timer = null;
+    }
+    const ids = Array.from(state.pendingIds);
+    state.pendingIds.clear();
+    if (ids.length === 0) {
+      return;
+    }
+    state.lastFlushAt = Date.now();
+    // Serialize flushes so overlapping schedule/force calls do not race localforage.
+    state.flushChain = state.flushChain
+      .catch(() => undefined)
+      .then(async () => {
+        for (const id of ids) {
+          const conversation = conversationsRef.current.find((item) => item.id === id);
+          if (conversation) {
+            await saveImageConversation(conversation);
+          }
+        }
+      });
+    await state.flushChain;
+  }, []);
+
+  const scheduleLocalPersist = useCallback(
+    (conversationId: string) => {
+      const state = localPersistStateRef.current;
+      state.pendingIds.add(conversationId);
+      // Pure trailing debounce: continuous 2s polls coalesce into one write per window.
+      // Terminal paths call flushPendingLocalPersists() so success is never delayed.
+      if (state.timer == null) {
+        state.timer = window.setTimeout(() => {
+          state.timer = null;
+          void flushPendingLocalPersists();
+        }, LOCAL_PERSIST_THROTTLE_MS);
+      }
+    },
+    [flushPendingLocalPersists],
+  );
+
   const persistConversation = async (conversation: ImageConversation) => {
     const nextConversations = sortImageConversations([
       conversation,
@@ -1542,28 +1772,48 @@ function ImagePageContent({ session }: { session: NonNullable<ReturnType<typeof 
     ]);
     conversationsRef.current = nextConversations;
     setConversations(nextConversations);
-    await saveImageConversation(conversation);
+    await flushPendingLocalPersists();
+    // User-driven saves go to the cloud first; the response refreshes the local cache.
+    void pushImageConversationsRemote(conversationsRef.current).catch(() => undefined);
   };
 
   const updateConversation = useCallback(
     async (
       conversationId: string,
       updater: (current: ImageConversation | null) => ImageConversation,
-      options: { persist?: boolean } = {},
+      options: { persist?: boolean | "memory" | "local" | "remote" } = {},
     ) => {
       const current = conversationsRef.current.find((item) => item.id === conversationId) ?? null;
-      const nextConversation = updater(current);
+      const nextConversation = stampChangedImageTurns(current, updater(current));
       const nextConversations = sortImageConversations([
         nextConversation,
         ...conversationsRef.current.filter((item) => item.id !== conversationId),
       ]);
       conversationsRef.current = nextConversations;
       setConversations(nextConversations);
-      if (options.persist !== false) {
-        await saveImageConversation(nextConversation);
+
+      // Default to local-only so cancel/retry/edit do not spam remote history merges.
+      // Pass persist: "remote" explicitly for terminal outcomes.
+      const persist =
+        options.persist === false || options.persist === "memory"
+          ? "memory"
+          : options.persist === "remote" || options.persist === true
+            ? "remote"
+            : "local";
+
+      if (persist === "memory") {
+        return;
       }
+      if (persist === "local") {
+        // Progress polls: throttle localforage + CHANGED noise; memory is already updated.
+        scheduleLocalPersist(conversationId);
+        return;
+      }
+      // Terminal / user actions: flush temporary progress, then submit the full snapshot to the cloud.
+      await flushPendingLocalPersists();
+      void pushImageConversationsRemote(conversationsRef.current).catch(() => undefined);
     },
-    [],
+    [flushPendingLocalPersists, scheduleLocalPersist],
   );
 
   const updateTurnProgress = useCallback(
@@ -1704,7 +1954,8 @@ function ImagePageContent({ session }: { session: NonNullable<ReturnType<typeof 
   }, []);
 
   const handleDeleteConversation = async (id: string) => {
-    const nextConversations = conversations.filter((item) => item.id !== id);
+    const previous = conversationsRef.current;
+    const nextConversations = previous.filter((item) => item.id !== id);
     conversationsRef.current = nextConversations;
     setConversations(nextConversations);
     if (selectedConversationId === id) {
@@ -1713,27 +1964,34 @@ function ImagePageContent({ session }: { session: NonNullable<ReturnType<typeof 
     }
 
     try {
-      await deleteImageConversation(id);
+      const saved = await deleteImageConversation(id);
+      conversationsRef.current = saved;
+      setConversations(saved);
     } catch (error) {
       const message = error instanceof Error ? error.message : "删除会话失败";
       toast.error(message);
-      const items = await listImageConversations();
-      conversationsRef.current = items;
-      setConversations(items);
+      conversationsRef.current = previous;
+      setConversations(previous);
+      if (selectedConversationId === id || !previous.some((item) => item.id === selectedConversationId)) {
+        setSelectedConversationId(pickFallbackConversationId(previous));
+      }
     }
   };
 
   const handleClearHistory = async () => {
+    const previous = conversationsRef.current;
     try {
-      await clearImageConversations();
-      conversationsRef.current = [];
-      setConversations([]);
-      setSelectedConversationId(null);
+      const saved = await clearImageConversations();
+      conversationsRef.current = saved;
+      setConversations(saved);
+      setSelectedConversationId(pickFallbackConversationId(saved));
       resetComposer();
       toast.success("已清空历史记录");
     } catch (error) {
       const message = error instanceof Error ? error.message : "清空历史记录失败";
       toast.error(message);
+      conversationsRef.current = previous;
+      setConversations(previous);
     }
   };
 
@@ -1810,15 +2068,19 @@ function ImagePageContent({ session }: { session: NonNullable<ReturnType<typeof 
   const handleContinueEdit = useCallback(
     async (conversationId: string, image: StoredImage | StoredReferenceImage) => {
       try {
-        const nextReference =
-          "dataUrl" in image
-            ? {
-                referenceImage: image,
-              }
-            : await buildReferenceImageFromStoredImage(
-                image,
-                `conversation-${conversationId}-${Date.now()}.${imageFileExtensionForOutputFormat(image.outputFormat)}`,
-              );
+        let nextReference: { referenceImage: StoredReferenceImage; file?: File } | null = null;
+        if ("id" in image) {
+          const stored = image as StoredImage;
+          nextReference = await buildReferenceImageFromStoredImage(
+            stored,
+            `conversation-${conversationId}-${Date.now()}.${imageFileExtensionForOutputFormat(stored.outputFormat)}`,
+          );
+        } else {
+          const asRef = image as StoredReferenceImage;
+          if (asRef.dataUrl || asRef.url || asRef.path) {
+            nextReference = { referenceImage: asRef };
+          }
+        }
         if (!nextReference) {
           return;
         }
@@ -1828,7 +2090,7 @@ function ImagePageContent({ session }: { session: NonNullable<ReturnType<typeof 
         setReferenceImages((prev) => [
           ...prev,
           {
-            ...nextReference.referenceImage,
+            ...nextReference!.referenceImage,
             source: "conversation",
           },
         ]);
@@ -1896,29 +2158,33 @@ function ImagePageContent({ session }: { session: NonNullable<ReturnType<typeof 
         const data = await updateManagedImageVisibility(path, visibility, options);
         const updatedVisibility = data.item.visibility || visibility;
         const updatedPath = data.item.path || path;
-        await updateConversation(conversationId, (current) => {
-          const conversation = current ?? targetConversation;
-          return {
-            ...conversation,
-            updatedAt: new Date().toISOString(),
-            turns: conversation.turns.map((turn) =>
-              turn.id === turnId
-                ? {
-                    ...turn,
-                    images: turn.images.map((image, index) =>
-                      index === imageIndex
-                        ? {
-                            ...image,
-                            path: updatedPath,
-                            visibility: updatedVisibility,
-                          }
-                        : image,
-                    ),
-                  }
-                : turn,
-            ),
-          };
-        });
+        await updateConversation(
+          conversationId,
+          (current) => {
+            const conversation = current ?? targetConversation;
+            return {
+              ...conversation,
+              updatedAt: new Date().toISOString(),
+              turns: conversation.turns.map((turn) =>
+                turn.id === turnId
+                  ? {
+                      ...turn,
+                      images: turn.images.map((image, index) =>
+                        index === imageIndex
+                          ? {
+                              ...image,
+                              path: updatedPath,
+                              visibility: updatedVisibility,
+                            }
+                          : image,
+                      ),
+                    }
+                  : turn,
+              ),
+            };
+          },
+          { persist: "remote" },
+        );
         clearImageManagerCache();
         toast.success(updatedVisibility === "public" ? "已公开到公开图库" : "已取消公开");
       } catch (error) {
@@ -2058,73 +2324,92 @@ function ImagePageContent({ session }: { session: NonNullable<ReturnType<typeof 
       });
       const applyTasks = async (tasks: CreationTask[]) => {
         const taskMap = new Map(tasks.map((task) => [task.id, task]));
-        await updateConversation(conversationId, (current) => {
-          const conversation = current ?? snapshot;
-          let completedActiveTurn = false;
-          const turns = conversation.turns.map((turn) => {
-            if (turn.id !== activeTurn.id) {
-              return turn;
-            }
-            const images = turn.images.map((image, imageIndex) => {
-              const taskId = image.taskId || image.id;
-              const task = taskMap.get(taskId);
-              const taskImage = image.taskId === taskId ? image : { ...image, taskId };
-              return task ? taskDataToStoredImage(taskImage, task, imageDataIndexForTask(turn.images, imageIndex), turn.visibility) : image;
-            });
-            const derived = deriveTurnStatusFromTaskMap(turn, images);
-            const currentCounts = getImageTurnLoadingCounts(turn);
-            const nextCounts = getImageTurnLoadingCounts({ images });
-            const nextTurn = {
-              ...turn,
-              ...derived,
-              processingStartedAt:
-                nextCounts.running > 0 && currentCounts.running === 0
-                  ? new Date().toISOString()
-                  : turn.processingStartedAt,
-              images,
-            };
-            if (isTurnInProgress(turn) && !isTurnInProgress(nextTurn)) {
-              completedActiveTurn = true;
-            }
-            return nextTurn;
-          });
-          const nextConversation = {
-            ...conversation,
-            turns,
-          };
-          return completedActiveTurn
-            ? {
-                ...nextConversation,
-                updatedAt: new Date().toISOString(),
+        let completedActiveTurn = false;
+        await updateConversation(
+          conversationId,
+          (current) => {
+            const conversation = current ?? snapshot;
+            const turns = conversation.turns.map((turn) => {
+              if (turn.id !== activeTurn.id) {
+                return turn;
               }
-            : nextConversation;
-        });
+              const images = turn.images.map((image, imageIndex) => {
+                const taskId = image.taskId || image.id;
+                const task = taskMap.get(taskId);
+                const taskImage = image.taskId === taskId ? image : { ...image, taskId };
+                return task
+                  ? taskDataToStoredImage(
+                      taskImage,
+                      task,
+                      imageDataIndexForTask(turn.images, imageIndex),
+                      turn.visibility,
+                      true,
+                    )
+                  : image;
+              });
+              const derived = deriveTurnStatusFromTaskMap(turn, images);
+              const nextTurn: ImageTurn = {
+                ...turn,
+                ...derived,
+                // Once the queue runner is active, always stamp processingStartedAt so
+                // deriveTurnStatus stays monotonic even if every slot reports queued.
+                processingStartedAt: turn.processingStartedAt || new Date().toISOString(),
+                images,
+              };
+              if (isTurnInProgress(turn) && !isTurnInProgress(nextTurn)) {
+                completedActiveTurn = true;
+              }
+              return nextTurn;
+            });
+            return {
+              ...conversation,
+              turns,
+              updatedAt: new Date().toISOString(),
+            };
+          },
+          // Poll progress is throttled locally; force a durable flush when the turn settles.
+          { persist: "local" },
+        );
+        if (completedActiveTurn) {
+          await flushPendingLocalPersists();
+          void pushImageConversationsRemote(conversationsRef.current).catch(() => undefined);
+        }
       };
 
       try {
-        await updateConversation(conversationId, (current) => {
-          const conversation = current ?? snapshot;
-          return {
-            ...conversation,
-            turns: conversation.turns.map((turn) =>
-              turn.id === activeTurn.id
-                ? {
-                    ...turn,
-                    status: "generating",
-                    error: undefined,
-                    images: turn.images.map((image, imageIndex) =>
-                      image.status === "loading"
-                        ? {
-                            ...image,
-                            taskId: imageTaskIdForImage(turn.id, turn.images, imageIndex),
-                          }
-                        : image,
-                    ),
-                  }
-                : turn,
-            ),
-          };
-        });
+        await updateConversation(
+          conversationId,
+          (current) => {
+            const conversation = current ?? snapshot;
+            const startedAt = new Date().toISOString();
+            return {
+              ...conversation,
+              updatedAt: startedAt,
+              turns: conversation.turns.map((turn) =>
+                turn.id === activeTurn.id
+                  ? {
+                      ...turn,
+                      status: "generating" as const,
+                      error: undefined,
+                      processingStartedAt: turn.processingStartedAt || startedAt,
+                      images: turn.images.map((image, imageIndex) =>
+                        image.status === "loading"
+                          ? {
+                              ...image,
+                              taskId: imageTaskIdForImage(turn.id, turn.images, imageIndex),
+                              // Keep taskStatus as-is (usually queued). Turn-level
+                              // generating + processingStartedAt already prevent badge flicker.
+                            }
+                          : image,
+                      ),
+                    }
+                  : turn,
+              ),
+            };
+          },
+          // First write after quiet window flushes immediately (leading-edge throttle).
+          { persist: "local" },
+        );
 
         updateTurnProgress(conversationId, activeTurn.id, {
           message:
@@ -2136,8 +2421,10 @@ function ImagePageContent({ session }: { session: NonNullable<ReturnType<typeof 
                 ? "正在读取参考图并准备上传"
                 : "正在创建图片生成任务",
         });
-        const referenceFiles = activeTurn.referenceImages.map((image, index) =>
-          dataUrlToFile(image.dataUrl, image.name || `${activeTurn.id}-${index + 1}.png`, image.type),
+        const referenceFiles = await Promise.all(
+          activeTurn.referenceImages.map((image, index) =>
+            referenceImageToFile(image, image.name || `${activeTurn.id}-${index + 1}.png`),
+          ),
         );
         if (usesReferenceImages(activeTurn.mode) && referenceFiles.length === 0) {
           throw new Error("未找到可用的参考图");
@@ -2179,15 +2466,24 @@ function ImagePageContent({ session }: { session: NonNullable<ReturnType<typeof 
           },
           [],
         );
-        const submitTaskGroup = (group: { taskId: string; count: number }) => {
+        const submitTaskGroup = async (group: { taskId: string; count: number }) => {
           if (activeTurn.mode === "chat") {
             if (activeTurn.referenceImages.length > 0) {
+              const chatReferenceImages = await Promise.all(
+                activeTurn.referenceImages.map(async (img, index) => {
+                  if (img.dataUrl) {
+                    return { name: img.name, dataUrl: img.dataUrl };
+                  }
+                  const file = await referenceImageToFile(img, img.name || `chat-ref-${index + 1}.png`);
+                  return { name: file.name, dataUrl: await readFileAsDataUrl(file) };
+                }),
+              );
               return createChatCompletionTask(
                 group.taskId,
                 activeTurn.prompt,
                 activeTurn.model,
                 taskMessages,
-                activeTurn.referenceImages.map((img) => ({ name: img.name, dataUrl: img.dataUrl })),
+                chatReferenceImages,
               );
             }
             return createChatCompletionTask(group.taskId, activeTurn.prompt, activeTurn.model, taskMessages);
@@ -2235,9 +2531,12 @@ function ImagePageContent({ session }: { session: NonNullable<ReturnType<typeof 
         const submitted = await Promise.all(pendingTaskGroups.map(submitTaskGroup));
         let activeTaskIds = new Set(submitted.filter(isActiveCreationTask).map((task) => task.id));
         await applyTasks(submitted);
-        const submittedStatus =
-          submitted.length > 0 && submitted.every((task) => task.status === "queued") ? "queued" : "generating";
-        updateTurnProgress(conversationId, activeTurn.id, imageTaskProgressMessage({ ...activeTurn, status: submittedStatus }));
+        // Submit responses are often still "queued"; keep UI on processing.
+        updateTurnProgress(
+          conversationId,
+          activeTurn.id,
+          imageTaskProgressMessage({ ...activeTurn, status: "generating" }),
+        );
 
         while (true) {
           const latestConversation = conversationsRef.current.find((conversation) => conversation.id === conversationId);
@@ -2259,7 +2558,9 @@ function ImagePageContent({ session }: { session: NonNullable<ReturnType<typeof 
             progressSnapshot && Number.isFinite(progressSnapshot.startedAt)
               ? Math.max(0, Math.floor((Date.now() - progressSnapshot.startedAt) / 1000))
               : Math.max(0, Math.floor((Date.now() - activeTurnStartedAt) / 1000));
-          const progressTurn = latestTurn ?? activeTurn;
+          const progressTurn = latestTurn
+            ? { ...latestTurn, status: latestTurn.status === "queued" ? ("generating" as const) : latestTurn.status }
+            : { ...activeTurn, status: "generating" as const };
           const progressCopy = imageTaskProgressMessage(progressTurn, elapsedSeconds);
           updateTurnProgress(conversationId, activeTurn.id, {
             message: progressCopy.message,
@@ -2287,6 +2588,11 @@ function ImagePageContent({ session }: { session: NonNullable<ReturnType<typeof 
           }
         }
 
+        // Poll loop exited with no loading task ids — snapshot is terminal (or empty).
+        // Drain any coalesced progress writes, then sync remote history once.
+        await flushPendingLocalPersists();
+        void pushImageConversationsRemote(conversationsRef.current).catch(() => undefined);
+
         updateTurnProgress(conversationId, activeTurn.id, {
           message: activeTurn.mode === "chat" ? "回复完成" : "生成完成",
           detail: "正在刷新会话",
@@ -2296,29 +2602,33 @@ function ImagePageContent({ session }: { session: NonNullable<ReturnType<typeof 
         }
         if (session.role === "user") {
           const data = await fetchProfile();
-          await setVerifiedAuthSession(authSessionFromLoginResponse(data, session.key));
+          await setVerifiedAuthSession(authSessionFromLoginResponse(data));
         }
       } catch (error) {
         const message = formatCreationTaskError(error, activeTurn.mode === "chat" ? "对话请求失败" : "生成图片失败");
-        await updateConversation(conversationId, (current) => {
-          const conversation = current ?? snapshot;
-          return {
-            ...conversation,
-            updatedAt: new Date().toISOString(),
-            turns: conversation.turns.map((turn) =>
-              turn.id === activeTurn.id
-                ? {
-                    ...turn,
-                    status: "error",
-                    error: message,
-                    images: turn.images.map((image) =>
-                      image.status === "loading" ? { ...image, status: "error", error: message } : image,
-                    ),
-                  }
-                : turn,
-            ),
-          };
-        });
+        await updateConversation(
+          conversationId,
+          (current) => {
+            const conversation = current ?? snapshot;
+            return {
+              ...conversation,
+              updatedAt: new Date().toISOString(),
+              turns: conversation.turns.map((turn) =>
+                turn.id === activeTurn.id
+                  ? {
+                      ...turn,
+                      status: "error" as const,
+                      error: message,
+                      images: turn.images.map((image) =>
+                        image.status === "loading" ? { ...image, status: "error" as const, error: message } : image,
+                      ),
+                    }
+                  : turn,
+              ),
+            };
+          },
+          { persist: "remote" },
+        );
         toast.error(message);
       } finally {
         clearTurnProgress(conversationId, activeTurn.id);
@@ -2338,7 +2648,7 @@ function ImagePageContent({ session }: { session: NonNullable<ReturnType<typeof 
         }
       }
     },
-    [clearTurnProgress, session.key, session.role, updateConversation, updateTurnProgress],
+    [clearTurnProgress, flushPendingLocalPersists, session.role, updateConversation, updateTurnProgress],
   );
   useEffect(() => {
     for (const conversation of conversations) {
@@ -2371,32 +2681,36 @@ function ImagePageContent({ session }: { session: NonNullable<ReturnType<typeof 
           const turnKey = imageTurnProgressKey(conversationId, turnId);
           cancelledTurnIdsRef.current.add(turnKey);
           clearTurnProgress(conversationId, turnId);
-          await updateConversation(conversationId, (current) => {
-            const conversation = current ?? targetConversation;
-            return {
-              ...conversation,
-              updatedAt: new Date().toISOString(),
-              turns: conversation.turns.map((turn) => {
-                if (turn.id !== turnId) {
-                  return turn;
-                }
-                const images = turn.images.map((image) =>
-                  image.status === "loading"
-                    ? {
-                        ...image,
-                        status: "cancelled" as const,
-                        error: "请求已终止",
-                      }
-                    : image,
-                );
-                return {
-                  ...turn,
-                  ...deriveTurnStatus({ ...turn, images }),
-                  images,
-                };
-              }),
-            };
-          });
+          await updateConversation(
+            conversationId,
+            (current) => {
+              const conversation = current ?? targetConversation;
+              return {
+                ...conversation,
+                updatedAt: new Date().toISOString(),
+                turns: conversation.turns.map((turn) => {
+                  if (turn.id !== turnId) {
+                    return turn;
+                  }
+                  const images = turn.images.map((image) =>
+                    image.status === "loading"
+                      ? {
+                          ...image,
+                          status: "cancelled" as const,
+                          error: "请求已终止",
+                        }
+                      : image,
+                  );
+                  return {
+                    ...turn,
+                    ...deriveTurnStatus({ ...turn, images }),
+                    images,
+                  };
+                }),
+              };
+            },
+            { persist: "remote" },
+          );
           toast.success("已终止对话请求");
         }
         return;
@@ -2408,40 +2722,49 @@ function ImagePageContent({ session }: { session: NonNullable<ReturnType<typeof 
       );
       const failedRequests = results.filter((result) => result.status === "rejected").length;
 
-      await updateConversation(conversationId, (current) => {
-        const conversation = current ?? targetConversation;
-        return {
-          ...conversation,
-          updatedAt: new Date().toISOString(),
-          turns: conversation.turns.map((turn) => {
-            if (turn.id !== turnId) {
-              return turn;
-            }
-            const images = turn.images.map((image, imageIndex) => {
-              if (image.status !== "loading") {
-                return image;
+      await updateConversation(
+        conversationId,
+        (current) => {
+          const conversation = current ?? targetConversation;
+          return {
+            ...conversation,
+            updatedAt: new Date().toISOString(),
+            turns: conversation.turns.map((turn) => {
+              if (turn.id !== turnId) {
+                return turn;
               }
-              const taskId = image.taskId || image.id;
-              const task = taskMap.get(taskId);
-              if (task) {
-                return taskDataToStoredImage({ ...image, taskId }, task, imageDataIndexForTask(turn.images, imageIndex), turn.visibility);
-              }
+              const images = turn.images.map((image, imageIndex) => {
+                if (image.status !== "loading") {
+                  return image;
+                }
+                const taskId = image.taskId || image.id;
+                const task = taskMap.get(taskId);
+                if (task) {
+                  return taskDataToStoredImage(
+                    { ...image, taskId },
+                    task,
+                    imageDataIndexForTask(turn.images, imageIndex),
+                    turn.visibility,
+                  );
+                }
+                return {
+                  ...image,
+                  taskId,
+                  status: "cancelled" as const,
+                  error: failedRequests > 0 ? "终止请求失败，已在本地停止等待" : "任务已终止",
+                };
+              });
+              const derived = deriveTurnStatus({ ...turn, images });
               return {
-                ...image,
-                taskId,
-                status: "cancelled" as const,
-                error: failedRequests > 0 ? "终止请求失败，已在本地停止等待" : "任务已终止",
+                ...turn,
+                ...derived,
+                images,
               };
-            });
-            const derived = deriveTurnStatus({ ...turn, images });
-            return {
-              ...turn,
-              ...derived,
-              images,
-            };
-          }),
-        };
-      });
+            }),
+          };
+        },
+        { persist: "remote" },
+      );
 
       if (failedRequests > 0) {
         toast.error(`部分终止请求失败：${failedRequests}/${taskIds.length}`);
@@ -2846,6 +3169,7 @@ function ImagePageContent({ session }: { session: NonNullable<ReturnType<typeof 
           };
         }),
         createdAt: now,
+        updatedAt: now,
         status: "queued",
       };
 
@@ -2999,15 +3323,15 @@ function ImagePageContent({ session }: { session: NonNullable<ReturnType<typeof 
                                 openLightbox(
                                   editingTurnDraft.referenceImages.map((item, itemIndex) => ({
                                     id: `${item.name}-${itemIndex}`,
-                                    src: item.dataUrl,
+                                    src: resolveReferenceImageSrc(item),
                                   })),
                                   index,
                                 )
                               }
                               aria-label={`预览参考图 ${image.name || index + 1}`}
                             >
-                              <img
-                                src={image.dataUrl}
+                              <AuthenticatedImage
+                                src={resolveReferenceImageSrc(image)}
                                 alt={image.name || `参考图 ${index + 1}`}
                                 className="h-full w-full object-cover"
                               />
@@ -3360,6 +3684,8 @@ function ImagePageContent({ session }: { session: NonNullable<ReturnType<typeof 
               progressByTurnKey={progressByTurnKey}
               progressNow={progressNow}
               promptPresets={IMAGE_PROMPT_PRESETS}
+              emptyStateMode={composerMode}
+              emptyStateModel={imageModel}
               onOpenLightbox={openLightbox}
               onApplyPromptPreset={handleApplyPromptPreset}
               onContinueEdit={handleContinueEdit}
@@ -3489,7 +3815,7 @@ function ImagePageContent({ session }: { session: NonNullable<ReturnType<typeof 
                 取消
               </Button>
               <Button onClick={() => void handleConfirmPublishImage()} disabled={visibilityMutatingImageKey !== ""}>
-                {visibilityMutatingImageKey ? <LoaderCircle className="size-4 animate-spin" /> : <Globe2 className="size-4" />}
+                {visibilityMutatingImageKey ? <ApiLoadingMark size="inline" label="正在更新图片可见性" /> : <Globe2 className="size-4" />}
                 公开
               </Button>
             </DialogFooter>
@@ -3527,7 +3853,7 @@ export default function ImagePage() {
   if (isCheckingAuth || !session) {
     return (
       <div className="flex min-h-[40vh] items-center justify-center">
-        <LoaderCircle className="size-5 animate-spin text-stone-400" />
+        <ApiLoadingMark size="page" label="正在验证登录状态" />
       </div>
     );
   }

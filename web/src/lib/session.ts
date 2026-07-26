@@ -4,7 +4,6 @@ import { verifySession, type LoginResponse } from "@/lib/api";
 import { clearAuthenticatedImageCache } from "@/lib/authenticated-image";
 import {
   clearStoredAuthSession,
-  getStoredAuthSession,
   setStoredAuthSession,
   type StoredAuthSession,
 } from "@/store/auth";
@@ -14,9 +13,8 @@ let verifyAuthSessionPromise: Promise<StoredAuthSession | null> | null = null;
 let authSessionVersion = 0;
 export const AUTH_SESSION_CHANGE_EVENT = "chatgpt2api:auth-session-change";
 
-export function authSessionFromLoginResponse(data: LoginResponse, key: string): StoredAuthSession {
+export function authSessionFromLoginResponse(data: LoginResponse): StoredAuthSession {
   return {
-    key,
     role: data.role,
     roleId: data.role_id,
     roleName: data.role_name,
@@ -88,14 +86,9 @@ export async function clearVerifiedAuthSession() {
 }
 
 async function verifyStoredAuthSession(): Promise<StoredAuthSession | null> {
-  const storedSession = await getStoredAuthSession();
-  if (!storedSession) {
-    return null;
-  }
-
   try {
-    const data = await verifySession(storedSession.key);
-    return authSessionFromLoginResponse(data, storedSession.key);
+    const data = await verifySession();
+    return authSessionFromLoginResponse(data);
   } catch {
     return null;
   }

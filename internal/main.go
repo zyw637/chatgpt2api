@@ -27,8 +27,11 @@ func main() {
 
 	server := &http.Server{
 		Addr:              ":" + port,
-		Handler:           app.Handler(),
-		ReadHeaderTimeout: 30 * time.Second,
+		Handler:           limitConcurrentRequests(app.Handler(), 256),
+		ReadHeaderTimeout: 10 * time.Second,
+		ReadTimeout:       2 * time.Minute,
+		IdleTimeout:       2 * time.Minute,
+		MaxHeaderBytes:    1 << 20,
 	}
 
 	go func() {
@@ -49,4 +52,20 @@ func main() {
 		logger.Error("server shutdown failed", "error", err)
 	}
 	app.Close()
+}
+
+func limitConcurrentRequests(next http.Handler, limit int) http.Handler {
+	if limit < 1 {
+		limit = 1
+	}
+	semaphore := make(chan struct{}, limit)
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		select {
+		case semaphore <- struct{}{}:
+			defer func() { <-semaphore }()
+			next.ServeHTTP(w, r)
+		default:
+			http.Error(w, "server is busy", http.StatusServiceUnavailable)
+		}
+	})
 }

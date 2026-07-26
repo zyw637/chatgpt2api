@@ -38,6 +38,17 @@ func serveAsset(w http.ResponseWriter, r *http.Request, name string) bool {
 	for _, candidate := range assetCandidates(name) {
 		info, err := fs.Stat(staticFS, candidate)
 		if err == nil && !info.IsDir() {
+			if candidate == "index.html" {
+				w.Header().Set("Cache-Control", "no-cache, no-store, must-revalidate")
+			}
+			if strings.HasSuffix(candidate, ".webmanifest") {
+				w.Header().Set("Content-Type", "application/manifest+json")
+				w.Header().Set("Cache-Control", "no-cache, no-store, must-revalidate")
+			}
+			if candidate == "sw.js" {
+				w.Header().Set("Cache-Control", "no-cache, no-store, must-revalidate")
+				w.Header().Set("Service-Worker-Allowed", "/")
+			}
 			http.ServeFileFS(w, r, staticFS, candidate)
 			return true
 		}

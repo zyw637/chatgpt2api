@@ -26,6 +26,8 @@ import {
 } from "react";
 
 import { ImageLightbox } from "@/components/image-lightbox";
+import { AuthenticatedImage } from "@/components/authenticated-image";
+import { ConversationComposerSurface, ConversationComposerToolbar } from "@/app/image/components/conversation-composer-surface";
 import { Input } from "@/components/ui/input";
 import { Popover, PopoverContent, PopoverTrigger } from "@/components/ui/popover";
 import { Select, SelectContent, SelectGroup, SelectItem, SelectTrigger, SelectValue } from "@/components/ui/select";
@@ -57,6 +59,7 @@ import {
   type ImageOutputFormat,
 } from "@/lib/api";
 import { cn } from "@/lib/utils";
+import { resolveReferenceImageSrc, type StoredReferenceImage } from "@/store/image-conversations";
 
 type ImageComposerProps = {
   composerMode: "chat" | "image";
@@ -76,7 +79,7 @@ type ImageComposerProps = {
   billingSummary: string;
   estimatedBillingUnits: number;
   billingBlocked: boolean;
-  referenceImages: Array<{ name: string; dataUrl: string }>;
+  referenceImages: StoredReferenceImage[];
   textareaRef: RefObject<HTMLTextAreaElement | null>;
   fileInputRef: RefObject<HTMLInputElement | null>;
   onComposerModeChange: (mode: "chat" | "image") => void;
@@ -330,7 +333,11 @@ export function ImageComposer({
   const promptAreaResizeRef = useRef<{ pointerOffsetY: number } | null>(null);
   const referenceImageDragDepthRef = useRef(0);
   const lightboxImages = useMemo(
-    () => referenceImages.map((image, index) => ({ id: `${image.name}-${index}`, src: image.dataUrl })),
+    () =>
+      referenceImages.map((image, index) => ({
+        id: `${image.name}-${index}`,
+        src: resolveReferenceImageSrc(image),
+      })),
     [referenceImages],
   );
   const imageModelLabel = imageModelOptions.find((option) => option.value === imageModel)?.label || imageModel;
@@ -626,8 +633,8 @@ export function ImageComposer({
                 className="group size-14 overflow-hidden rounded-xl border border-stone-200 bg-stone-50 transition hover:border-stone-300 sm:size-16"
                 aria-label={`预览参考图 ${image.name || index + 1}`}
               >
-                <img
-                  src={image.dataUrl}
+                <AuthenticatedImage
+                  src={resolveReferenceImageSrc(image)}
                   alt={image.name || `参考图 ${index + 1}`}
                   className="h-full w-full object-cover"
                 />
@@ -648,10 +655,9 @@ export function ImageComposer({
         </div>
       ) : null}
 
-      <div
+      <ConversationComposerSurface
         ref={composerPanelRef}
         className={cn(
-          "relative overflow-visible rounded-[30px] border border-[#dedee3] bg-[#fffcff]/95 shadow-[0_20px_70px_-42px_rgba(15,23,42,0.5)] backdrop-blur-xl transition-colors dark:border-border dark:bg-card/95 dark:shadow-[0_24px_80px_-38px_rgba(0,0,0,0.78)] sm:rounded-[24px] sm:border-[#f2f3f5] sm:bg-white/95 sm:shadow-[0_24px_80px_-34px_rgba(15,23,42,0.42)] sm:dark:border-border sm:dark:bg-card/95",
           isReferenceImageDragActive &&
             "border-[#1456f0] bg-[#eef4ff]/95 dark:border-sky-500/70 dark:bg-sky-950/45 sm:border-[#1456f0] sm:bg-[#eef4ff]/95 sm:dark:border-sky-500/70 sm:dark:bg-sky-950/45",
         )}
@@ -723,9 +729,8 @@ export function ImageComposer({
             style={{ height: promptAreaHeight }}
           />
 
-          <div
+          <ConversationComposerToolbar
             ref={composerToolbarRef}
-            className="rounded-b-[30px] bg-transparent px-3 pt-1 pb-3 sm:rounded-b-[24px] sm:border-t sm:border-[#f2f3f5] sm:bg-white/80 sm:px-4 sm:py-2.5 sm:dark:border-border sm:dark:bg-card/80"
             onClick={(event) => event.stopPropagation()}
           >
             <div className="grid grid-cols-[minmax(0,1fr)_auto] items-center gap-2 sm:gap-3">
@@ -1142,9 +1147,9 @@ export function ImageComposer({
               <span>{billingSummary}</span>
               <span>预计消耗 {estimatedBillingUnits} 图片单位</span>
             </div>
-          </div>
+          </ConversationComposerToolbar>
         </div>
-      </div>
+      </ConversationComposerSurface>
     </ImageComposerDock>
   );
 }

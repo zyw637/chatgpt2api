@@ -2,7 +2,6 @@
 
 import { useState } from "react";
 import {
-  LoaderCircle,
   RefreshCw,
   Save,
   ScrollText,
@@ -10,6 +9,7 @@ import {
 } from "lucide-react";
 
 import { Button } from "@/components/ui/button";
+import { ApiLoadingMark } from "@/components/api-loading-mark";
 import { Checkbox } from "@/components/ui/checkbox";
 import {
   Dialog,
@@ -146,7 +146,7 @@ export function LogGovernanceCard() {
         tone="amber"
       >
         <div className="flex items-center justify-center py-10">
-          <LoaderCircle className="size-5 animate-spin text-muted-foreground" />
+          <ApiLoadingMark size="section" label="正在加载日志配置" />
         </div>
       </SettingsCard>
     );
@@ -165,7 +165,7 @@ export function LogGovernanceCard() {
           disabled={isSavingConfig}
         >
           {isSavingConfig ? (
-            <LoaderCircle data-icon="inline-start" className="animate-spin" />
+            <ApiLoadingMark size="inline" label="正在保存日志配置" />
           ) : (
             <Save data-icon="inline-start" />
           )}
@@ -187,11 +187,7 @@ export function LogGovernanceCard() {
               onClick={() => void loadLogGovernance()}
               disabled={isLoadingLogGovernance}
             >
-              {isLoadingLogGovernance ? (
-                <LoaderCircle data-icon="inline-start" className="animate-spin" />
-              ) : (
-                <RefreshCw data-icon="inline-start" />
-              )}
+              <RefreshCw data-icon="inline-start" className={cn(isLoadingLogGovernance && "animate-spin")} />
               刷新统计
             </Button>
           </div>
@@ -264,7 +260,7 @@ export function LogGovernanceCard() {
               disabled={isCleaningLogs || total === 0}
             >
               {isCleaningLogs ? (
-                <LoaderCircle data-icon="inline-start" className="animate-spin" />
+                <ApiLoadingMark size="inline" label="正在清理日志" />
               ) : (
                 <Trash2 data-icon="inline-start" />
               )}
@@ -273,7 +269,7 @@ export function LogGovernanceCard() {
           </div>
           {isLoadingLogGovernance ? (
             <div className="flex items-center justify-center rounded-[16px] border border-border/80 bg-background py-8">
-              <LoaderCircle className="size-5 animate-spin text-muted-foreground" />
+              <ApiLoadingMark size="section" label="正在加载日志统计" />
             </div>
           ) : (
             <div className="grid gap-3 sm:grid-cols-3">
@@ -321,7 +317,7 @@ export function LogGovernanceCard() {
               disabled={isCleaningLogs}
             >
               {isCleaningLogs ? (
-                <LoaderCircle data-icon="inline-start" className="animate-spin" />
+                <ApiLoadingMark size="inline" label="正在清理日志" />
               ) : (
                 <Trash2 data-icon="inline-start" />
               )}

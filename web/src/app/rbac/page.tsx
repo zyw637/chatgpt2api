@@ -2,7 +2,6 @@
 
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import {
-  LoaderCircle,
   Plus,
   RefreshCw,
   Save,
@@ -13,6 +12,7 @@ import {
 import { toast } from "sonner";
 
 import { PageHeader } from "@/components/page-header";
+import { ApiLoadingMark } from "@/components/api-loading-mark";
 import { PermissionEditor } from "@/components/permission-editor";
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
@@ -238,7 +238,7 @@ function RBACContent() {
               disabled={!selectedRole || !isDirty || isSaving || isLoading}
               className="h-10 rounded-lg"
             >
-              {isSaving ? <LoaderCircle className="size-4 animate-spin" /> : <Save className="size-4" />}
+              {isSaving ? <ApiLoadingMark size="inline" label="正在保存权限" /> : <Save className="size-4" />}
               保存
             </Button>
           </>
@@ -266,7 +266,7 @@ function RBACContent() {
             <div className="max-h-[calc(100vh-18rem)] min-h-[360px] overflow-y-auto">
               {isLoading ? (
                 <div className="flex min-h-[320px] items-center justify-center">
-                  <LoaderCircle className="size-5 animate-spin text-stone-400" />
+                  <ApiLoadingMark size="section" label="正在加载角色" />
                 </div>
               ) : null}
               {!isLoading && filteredRoles.length === 0 ? (
@@ -369,7 +369,7 @@ function RBACContent() {
             <div className="min-h-0 overflow-y-auto overscroll-contain p-5 [scrollbar-color:rgba(142,142,147,.45)_transparent] [scrollbar-gutter:stable] [scrollbar-width:thin] xl:max-h-[calc(100dvh-20rem)] [&::-webkit-scrollbar]:w-1.5 [&::-webkit-scrollbar-thumb]:rounded-full [&::-webkit-scrollbar-thumb]:bg-[#8e8e93]/45 [&::-webkit-scrollbar-track]:bg-transparent">
               {isLoading ? (
                 <div className="flex min-h-[420px] items-center justify-center">
-                  <LoaderCircle className="size-5 animate-spin text-stone-400" />
+                  <ApiLoadingMark size="section" label="正在加载权限" />
                 </div>
               ) : selectedRole ? (
                 <PermissionEditor
@@ -420,7 +420,7 @@ function RBACContent() {
               取消
             </Button>
             <Button type="button" className="h-10 rounded-xl px-5" onClick={() => void handleCreate()} disabled={isCreating}>
-              {isCreating ? <LoaderCircle className="size-4 animate-spin" /> : <Plus className="size-4" />}
+              {isCreating ? <ApiLoadingMark size="inline" label="正在创建角色" /> : <Plus className="size-4" />}
               创建
             </Button>
           </DialogFooter>
@@ -446,7 +446,7 @@ function RBACContent() {
               onClick={() => void handleDelete()}
               disabled={isDeleting}
             >
-              {isDeleting ? <LoaderCircle className="size-4 animate-spin" /> : <Trash2 className="size-4" />}
+              {isDeleting ? <ApiLoadingMark size="inline" label="正在删除角色" /> : <Trash2 className="size-4" />}
               删除
             </Button>
           </DialogFooter>
@@ -459,7 +459,7 @@ function RBACContent() {
 export default function RBACPage() {
   const { isCheckingAuth, session } = useAuthGuard(undefined, "/rbac");
   if (isCheckingAuth || !session) {
-    return <div className="flex min-h-[40vh] items-center justify-center"><LoaderCircle className="size-5 animate-spin text-stone-400" /></div>;
+    return <div className="flex min-h-[40vh] items-center justify-center"><ApiLoadingMark size="page" label="正在验证登录状态" /></div>;
   }
   return <RBACContent />;
 }

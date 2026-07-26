@@ -1,9 +1,10 @@
 "use client";
 
-import { Import, LoaderCircle, Search } from "lucide-react";
+import { Import, Search } from "lucide-react";
 import { useMemo } from "react";
 
 import { Button } from "@/components/ui/button";
+import { ApiLoadingMark } from "@/components/api-loading-mark";
 import { Checkbox } from "@/components/ui/checkbox";
 import {
   Dialog,
@@ -236,7 +237,7 @@ export function ImportBrowserDialog() {
             disabled={isStartingImport || selectedNames.length === 0}
           >
             {isStartingImport ? (
-              <LoaderCircle data-icon="inline-start" className="animate-spin" />
+              <ApiLoadingMark size="inline" label="正在导入账户" />
             ) : (
               <Import data-icon="inline-start" />
             )}

@@ -32,9 +32,11 @@ type PermissionSet struct {
 
 var fullMenuPermissions = []MenuPermission{
 	{ID: "image", Label: "创作台", Path: "/image", Icon: "image", Order: 10},
+	{ID: "external-chat", Label: "API 聊天", Path: "/external-chat", Icon: "messages-square", Order: 14},
+	{ID: "external-image", Label: "API 生图", Path: "/external-image", Icon: "wand-sparkles", Order: 15},
+	{ID: "external-image-providers", Label: "API 渠道管理", Path: "/external-image/providers", Icon: "server-cog", Order: 16},
 	{ID: "image-manager", Label: "图片库", Path: "/image-manager", Icon: "images", Order: 20},
 	{ID: "accounts", Label: "号池管理", Path: "/accounts", Icon: "wallet-cards", Order: 30},
-	{ID: "register", Label: "注册机", Path: "/register", Icon: "user-plus", Order: 40},
 	{ID: "users", Label: "用户管理", Path: "/users", Icon: "users", Order: 50},
 	{ID: "rbac", Label: "角色权限", Path: "/rbac", Icon: "shield-check", Order: 60},
 	{ID: "logs", Label: "日志管理", Path: "/logs", Icon: "scroll-text", Order: 70},
@@ -42,6 +44,8 @@ var fullMenuPermissions = []MenuPermission{
 }
 
 var apiPermissionCatalog = []APIPermission{
+	// /api/image-conversations is intentionally omitted: every authenticated user may
+	// read/sync their own image conversation history (see isPermissionCheckSkipped).
 	apiPermission("GET", "/v1/models", "模型列表", "创作", false),
 	apiPermission("POST", "/v1/images/generations", "文生图", "创作", false),
 	apiPermission("POST", "/v1/images/edits", "图生图", "创作", false),
@@ -50,6 +54,18 @@ var apiPermissionCatalog = []APIPermission{
 	apiPermission("POST", "/v1/messages", "Messages", "创作", false),
 	apiPermission("GET", "/api/creation-tasks", "查看创作任务", "创作", true),
 	apiPermission("POST", "/api/creation-tasks", "提交/取消创作任务", "创作", true),
+	apiPermission("GET", "/api/external-chat-providers", "查看外部聊天渠道", "API 聊天", false),
+	apiPermission("POST", "/api/external-chat/completions", "提交外部聊天请求", "API 聊天", false),
+	apiPermission("GET", "/api/external-chat-conversations", "查看 API 聊天记录", "API 聊天", false),
+	apiPermission("PUT", "/api/external-chat-conversations", "同步 API 聊天记录", "API 聊天", false),
+	apiPermission("GET", "/api/external-image-providers", "查看外部生图渠道", "API 生图", true),
+	apiPermission("GET", "/api/external-image-tasks", "查看外部生图任务", "API 生图", true),
+	apiPermission("POST", "/api/external-image-tasks", "提交/取消外部生图任务", "API 生图", true),
+	apiPermission("DELETE", "/api/external-image-tasks", "删除外部生图任务", "API 生图", true),
+	apiPermission("GET", "/api/admin/external-image-providers", "管理 API 渠道", "API 渠道管理", true),
+	apiPermission("POST", "/api/admin/external-image-providers", "创建/测试 API 渠道", "API 渠道管理", true),
+	apiPermission("PATCH", "/api/admin/external-image-providers", "修改 API 渠道", "API 渠道管理", true),
+	apiPermission("DELETE", "/api/admin/external-image-providers", "删除 API 渠道", "API 渠道管理", true),
 	apiPermission("GET", "/api/images", "查看图片库", "图片库", false),
 	apiPermission("PATCH", "/api/images/visibility", "发布/收回图片", "图片库", false),
 	apiPermission("DELETE", "/api/images", "删除图片", "图片库", false),
@@ -68,8 +84,6 @@ var apiPermissionCatalog = []APIPermission{
 	apiPermission("POST", "/api/accounts/update", "编辑号池账号", "号池管理", false),
 	apiPermission("POST", "/api/accounts/toggle-enabled", "启用或禁用号池账号", "号池管理", false),
 	apiPermission("DELETE", "/api/accounts", "删除号池账号", "号池管理", false),
-	apiPermission("GET", "/api/register", "查看注册机", "注册机", true),
-	apiPermission("POST", "/api/register", "控制注册机", "注册机", true),
 	apiPermission("GET", "/api/logs", "查看日志", "日志管理", false),
 	apiPermission("GET", "/api/logs/governance", "查看日志治理", "日志管理", false),
 	apiPermission("POST", "/api/logs/governance", "清理日志数据", "日志管理", false),
@@ -135,6 +149,8 @@ func DefaultPermissionSetForRole(role string) PermissionSet {
 	return PermissionSet{
 		MenuPaths: NormalizeMenuPermissions([]string{
 			"/image",
+			"/external-chat",
+			"/external-image",
 			"/image-manager",
 		}),
 		APIPermissions: NormalizeAPIPermissions([]string{
@@ -146,6 +162,14 @@ func DefaultPermissionSetForRole(role string) PermissionSet {
 			APIPermissionKey("POST", "/v1/messages"),
 			APIPermissionKey("GET", "/api/creation-tasks"),
 			APIPermissionKey("POST", "/api/creation-tasks"),
+			APIPermissionKey("GET", "/api/external-chat-providers"),
+			APIPermissionKey("POST", "/api/external-chat/completions"),
+			APIPermissionKey("GET", "/api/external-chat-conversations"),
+			APIPermissionKey("PUT", "/api/external-chat-conversations"),
+			APIPermissionKey("GET", "/api/external-image-providers"),
+			APIPermissionKey("GET", "/api/external-image-tasks"),
+			APIPermissionKey("POST", "/api/external-image-tasks"),
+			APIPermissionKey("DELETE", "/api/external-image-tasks"),
 			APIPermissionKey("GET", "/api/images"),
 			APIPermissionKey("PATCH", "/api/images/visibility"),
 			APIPermissionKey("GET", "/api/auth/users"),

@@ -4,10 +4,7 @@ import { useEffect, useRef, useState } from "react";
 import { useNavigate } from "react-router-dom";
 import {
   ArrowRight,
-  Github,
-  Send,
   KeyRound,
-  LoaderCircle,
   LogIn,
   MoonStar,
   ShieldCheck,
@@ -24,6 +21,7 @@ import { Input } from "@/components/ui/input";
 import webConfig from "@/constants/common-env";
 import { fetchAuthProviders, login, registerAccount } from "@/lib/api";
 import { authSessionFromLoginResponse, setVerifiedAuthSession } from "@/lib/session";
+import { DEFAULT_APP_TITLE } from "@/lib/app-meta";
 import {
   applyColorTheme,
   getPreferredColorTheme,
@@ -32,12 +30,11 @@ import {
 } from "@/lib/theme";
 import { useAppMeta } from "@/lib/use-app-meta";
 import { useRedirectIfAuthenticated } from "@/lib/use-auth-guard";
+import { ApiLoadingMark } from "@/components/api-loading-mark";
 import { getDefaultRouteForSession } from "@/store/auth";
 
 const loginBackgroundClass =
   "bg-[#fff9fb] bg-[radial-gradient(rgba(20,86,240,0.12)_1px,transparent_1px),linear-gradient(145deg,#fff8fa_0%,#ffffff_48%,#f4f8ff_100%)] [background-position:0_0,center] [background-size:12px_12px,cover] dark:bg-[#090d16] dark:bg-[radial-gradient(rgba(96,165,250,0.16)_1px,transparent_1px),linear-gradient(145deg,#080b13_0%,#101827_52%,#070b12_100%)]";
-const githubUrl = "https://github.com/ZyphrZero/chatgpt2api";
-const telegramUrl = "https://t.me/+YBR7t_CPOYBkYzU1";
 
 export default function LoginPage() {
   const navigate = useNavigate();
@@ -92,11 +89,7 @@ export default function LoginPage() {
       const data = isRegisterMode
         ? await registerAccount(normalizedUsername, password, normalizedName)
         : await login(normalizedUsername, password);
-      const token = String(data.token || "").trim();
-      if (!token) {
-        throw new Error("登录会话签发失败");
-      }
-      const session = authSessionFromLoginResponse(data, token);
+      const session = authSessionFromLoginResponse(data);
       await setVerifiedAuthSession(session);
       toast.success(isRegisterMode ? "注册成功" : "登录成功");
       navigate(getDefaultRouteForSession(session), { replace: true });
@@ -131,40 +124,18 @@ export default function LoginPage() {
   if (isCheckingAuth) {
     return (
       <div
-        className={`${loginBackgroundClass} fixed inset-0 z-50 grid min-h-svh w-screen place-items-center overflow-hidden px-4 py-6`}
+        className={`${loginBackgroundClass} relative z-50 grid min-h-[100dvh] w-full place-items-center overflow-hidden px-4 py-6`}
       >
-        <LoaderCircle className="size-5 animate-spin text-[#45515e] dark:text-white/60" />
+        <ApiLoadingMark size="page" label="正在检查登录状态" />
       </div>
     );
   }
 
   return (
     <div
-      className={`${loginBackgroundClass} fixed inset-0 z-50 flex min-h-svh w-screen items-center justify-center overflow-y-auto px-4 py-6 font-login [align-items:safe_center] sm:px-6 lg:px-8`}
+      className={`${loginBackgroundClass} relative z-50 flex min-h-[100dvh] w-full items-start justify-center overflow-x-hidden px-4 pt-[calc(env(safe-area-inset-top)+5rem)] pb-[calc(env(safe-area-inset-bottom)+1.5rem)] font-login sm:items-center sm:px-6 sm:py-6 lg:px-8`}
     >
-      <div className="fixed right-4 top-4 z-50 flex items-center gap-2 sm:right-6 sm:top-6">
-        <Button
-          asChild
-          type="button"
-          variant="outline"
-          className="h-9 rounded-full border-border/60 bg-background/80 px-3 text-muted-foreground shadow-sm backdrop-blur hover:text-foreground"
-        >
-          <a href={telegramUrl} target="_blank" rel="noreferrer" aria-label="加入 Telegram 群组">
-            <Send data-icon="inline-start" />
-            <span className="hidden sm:inline">Telegram</span>
-          </a>
-        </Button>
-        <Button
-          asChild
-          type="button"
-          variant="outline"
-          className="h-9 rounded-full border-border/60 bg-background/80 px-3 text-muted-foreground shadow-sm backdrop-blur hover:text-foreground"
-        >
-          <a href={githubUrl} target="_blank" rel="noreferrer" aria-label="打开 GitHub 仓库">
-            <Github data-icon="inline-start" />
-            <span className="hidden sm:inline">GitHub</span>
-          </a>
-        </Button>
+      <div className="absolute top-[calc(env(safe-area-inset-top)+1rem)] right-[calc(env(safe-area-inset-right)+1rem)] z-50 flex items-center gap-2 sm:right-6 sm:top-6">
         <AnnouncementNotifications target="login" className="size-9" />
         <Button
           ref={themeToggleRef}
@@ -182,19 +153,19 @@ export default function LoginPage() {
         </Button>
       </div>
 
-      <div className="relative z-10 grid w-full max-w-[58rem] overflow-hidden rounded-[32px] border border-white/80 bg-white/95 shadow-[0_28px_80px_rgba(15,23,42,0.12),0_10px_28px_rgba(44,30,116,0.08)] backdrop-blur transition-[min-height] duration-300 ease-[cubic-bezier(0.22,1,0.36,1)] motion-reduce:transition-none dark:border-white/10 dark:bg-[#111827]/92 dark:shadow-[0_30px_90px_rgba(2,6,23,0.58),0_12px_32px_rgba(2,6,23,0.32)] lg:min-h-[39rem] lg:grid-cols-[minmax(0,28rem)_minmax(0,1fr)]">
-        <section className="flex min-h-[500px] flex-col justify-center px-6 py-8 sm:px-10 lg:px-12">
+      <div className="relative z-10 grid w-full max-w-[58rem] overflow-hidden rounded-[32px] border border-white/80 bg-white/95 shadow-[0_28px_80px_rgba(15,23,42,0.12),0_10px_28px_rgba(44,30,116,0.08)] transition-[min-height] duration-300 ease-[cubic-bezier(0.22,1,0.36,1)] motion-reduce:transition-none dark:border-white/10 dark:bg-[#111827]/95 dark:shadow-[0_30px_90px_rgba(2,6,23,0.58),0_12px_32px_rgba(2,6,23,0.32)] lg:min-h-[39rem] lg:grid-cols-[minmax(0,28rem)_minmax(0,1fr)]">
+        <section className="flex min-h-0 flex-col justify-center px-6 py-8 sm:min-h-[500px] sm:px-10 lg:px-12">
           <div className="flex flex-col gap-9 transition-[gap] duration-300 ease-[cubic-bezier(0.22,1,0.36,1)] motion-reduce:transition-none">
             <div className="flex items-center gap-3">
               <img
-                src="/logo-mark.svg"
+                src="/pwa-icon-192.png?v=20260719-3"
                 alt=""
                 aria-hidden="true"
                 className="size-11 rounded-[16px] shadow-[0_12px_16px_-4px_rgba(36,36,36,0.12)]"
               />
               <div className="grid min-w-0 leading-none">
                 <div className="truncate text-sm font-semibold tracking-[-0.02em] text-[#222222] dark:text-white">
-                  {appMeta.app_title || "chatgpt2api"}
+                  {appMeta.app_title || DEFAULT_APP_TITLE}
                 </div>
                 <div className="truncate text-[10px] font-medium tracking-[0.28em] text-[#8e8e93] uppercase dark:text-white/50">
                   {appMeta.project_name && appMeta.project_name !== appMeta.app_title ? appMeta.project_name : "Control Center"}
@@ -213,8 +184,8 @@ export default function LoginPage() {
                 </h1>
                 <p className="max-w-[340px] text-sm leading-6 text-[#45515e] transition-opacity duration-200 dark:text-white/62">
                   {isRegisterMode
-                    ? `创建账号后进入 ${appMeta.app_title || "chatgpt2api"} 控制台。`
-                    : `使用账号和密码进入 ${appMeta.app_title || "chatgpt2api"} 控制台。`}
+                    ? `创建账号后进入 ${appMeta.app_title || DEFAULT_APP_TITLE} 控制台。`
+                    : `使用账号和密码进入 ${appMeta.app_title || DEFAULT_APP_TITLE} 控制台。`}
                 </p>
               </div>
             </div>
@@ -239,7 +210,11 @@ export default function LoginPage() {
                     value={username}
                     onChange={(event) => setUsername(event.target.value)}
                     placeholder="admin"
-                    className="h-12 rounded-[16px] bg-white/90 pl-10 shadow-[0_6px_18px_rgba(24,40,72,0.05)] dark:border-white/12 dark:bg-white/8 dark:text-white dark:placeholder:text-white/38 dark:shadow-[0_12px_26px_rgba(2,6,23,0.24)]"
+                    autoCapitalize="none"
+                    autoCorrect="off"
+                    spellCheck={false}
+                    enterKeyHint="next"
+                    className="relative z-10 h-12 touch-manipulation appearance-none rounded-[16px] bg-white/90 pl-10 text-base select-text shadow-[0_6px_18px_rgba(24,40,72,0.05)] [-webkit-user-select:text] dark:border-white/12 dark:bg-white/8 dark:text-white dark:placeholder:text-white/38 dark:shadow-[0_12px_26px_rgba(2,6,23,0.24)]"
                   />
                 </div>
               </div>
@@ -264,7 +239,8 @@ export default function LoginPage() {
                         value={displayName}
                         onChange={(event) => setDisplayName(event.target.value)}
                         placeholder="可选"
-                        className="h-12 rounded-[16px] bg-white/90 pl-10 shadow-[0_6px_18px_rgba(24,40,72,0.05)] dark:border-white/12 dark:bg-white/8 dark:text-white dark:placeholder:text-white/38 dark:shadow-[0_12px_26px_rgba(2,6,23,0.24)]"
+                        enterKeyHint="next"
+                        className="relative z-10 h-12 touch-manipulation appearance-none rounded-[16px] bg-white/90 pl-10 text-base select-text shadow-[0_6px_18px_rgba(24,40,72,0.05)] [-webkit-user-select:text] dark:border-white/12 dark:bg-white/8 dark:text-white dark:placeholder:text-white/38 dark:shadow-[0_12px_26px_rgba(2,6,23,0.24)]"
                       />
                     </div>
                   </div>
@@ -283,7 +259,8 @@ export default function LoginPage() {
                     value={password}
                     onChange={(event) => setPassword(event.target.value)}
                     placeholder={isRegisterMode ? "至少 8 位" : "请输入密码"}
-                    className="h-12 rounded-[16px] bg-white/90 pl-10 shadow-[0_6px_18px_rgba(24,40,72,0.05)] dark:border-white/12 dark:bg-white/8 dark:text-white dark:placeholder:text-white/38 dark:shadow-[0_12px_26px_rgba(2,6,23,0.24)]"
+                    enterKeyHint="go"
+                    className="relative z-10 h-12 touch-manipulation appearance-none rounded-[16px] bg-white/90 pl-10 text-base select-text shadow-[0_6px_18px_rgba(24,40,72,0.05)] [-webkit-user-select:text] dark:border-white/12 dark:bg-white/8 dark:text-white dark:placeholder:text-white/38 dark:shadow-[0_12px_26px_rgba(2,6,23,0.24)]"
                   />
                 </div>
               </div>
@@ -299,7 +276,7 @@ export default function LoginPage() {
                   <span className="pointer-events-none absolute inset-[1px] rounded-[1.35rem] border border-white/55 dark:border-white/10" />
                   <span className="relative z-10 flex items-center gap-2 font-semibold tracking-[-0.01em] transition-opacity duration-150">
                     {isSubmitting ? (
-                      <LoaderCircle className="size-4 animate-spin" />
+                      <ApiLoadingMark size="inline" label="正在提交登录请求" />
                     ) : (
                       <ArrowRight className="size-4" />
                     )}

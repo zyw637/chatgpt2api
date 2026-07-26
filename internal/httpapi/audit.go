@@ -9,6 +9,7 @@ import (
 	"net"
 	"net/http"
 	"net/url"
+	"os"
 	"strconv"
 	"strings"
 	"time"
@@ -20,11 +21,15 @@ import (
 const (
 	maxAuditRequestPayloadBytes  = 64 * 1024
 	maxAuditResponsePayloadBytes = 8 * 1024
+	maxJSONRequestBodyBytes      = 8 << 20
+	maxMultipartRequestBodyBytes = 128 << 20
+	maxExternalMultipartBytes    = 50 << 20
 )
 
 type requestIdentityContextKey struct{}
 type auditRequestContextKey struct{}
 type businessLogContextKey struct{}
+type requestStartedContextKey struct{}
 
 type auditRequestCapture struct {
 	args      any
@@ -94,11 +99,15 @@ func (a *App) serveObservedHTTP(w http.ResponseWriter, r *http.Request, routes [
 		return
 	}
 
-	requestCapture := captureAuditRequest(r)
-	*r = *r.WithContext(withAuditRequestCapture(r.Context(), requestCapture))
 	recorder := &auditResponseWriter{ResponseWriter: w}
 	start := time.Now()
-	a.serveHTTP(recorder, r, routes)
+	*r = *r.WithContext(context.WithValue(r.Context(), requestStartedContextKey{}, start))
+	requestCapture := auditRequestCapture{}
+	if applyRequestBodyLimit(recorder, r) {
+		requestCapture = captureAuditRequest(r)
+		*r = *r.WithContext(withAuditRequestCapture(r.Context(), requestCapture))
+		a.serveHTTP(recorder, r, routes)
+	}
 	duration := time.Since(start)
 	status := recorder.statusCode()
 
@@ -106,6 +115,26 @@ func (a *App) serveObservedHTTP(w http.ResponseWriter, r *http.Request, routes [
 	if shouldWriteAuditLog(r, status) {
 		a.writeAuditLog(r, recorder, status, duration, requestCapture)
 	}
+}
+
+func applyRequestBodyLimit(w http.ResponseWriter, r *http.Request) bool {
+	if r == nil || r.Body == nil || r.Method == http.MethodGet || r.Method == http.MethodHead {
+		return true
+	}
+	limit := int64(maxJSONRequestBodyBytes)
+	if strings.Contains(strings.ToLower(r.Header.Get("Content-Type")), "multipart/form-data") {
+		limit = maxMultipartRequestBodyBytes
+		if r.URL.Path == "/api/external-image-tasks/generations" {
+			limit = maxExternalMultipartBytes
+		}
+	}
+	if r.ContentLength > limit {
+		applyCORS(w, r)
+		util.WriteError(w, http.StatusRequestEntityTooLarge, "request body too large")
+		return false
+	}
+	r.Body = http.MaxBytesReader(w, r.Body, limit)
+	return true
 }
 
 func (a *App) logHTTPRequest(r *http.Request, status int, duration time.Duration) {
@@ -145,8 +174,10 @@ func (a *App) writeAuditLog(r *http.Request, recorder *auditResponseWriter, stat
 		"log_level":      logLevelForStatus(status),
 	}
 	addAuditRequestDetail(detail, requestCapture)
-	if responseBody := normalizeAuditPayload(recorder.body.Bytes()); responseBody != nil {
-		detail["response_body"] = responseBody
+	if r.URL.Path != "/api/external-chat/completions" && r.URL.Path != "/api/external-chat-conversations" {
+		if responseBody := normalizeAuditPayload(recorder.body.Bytes()); responseBody != nil {
+			detail["response_body"] = responseBody
+		}
 	}
 	if identity, ok := requestIdentity(r.Context()); ok {
 		addIdentityLogDetail(detail, identity)
@@ -192,6 +223,14 @@ func requestBusinessLogged(ctx context.Context) bool {
 	return value
 }
 
+func requestStartedAt(ctx context.Context) time.Time {
+	startedAt, _ := ctx.Value(requestStartedContextKey{}).(time.Time)
+	if startedAt.IsZero() {
+		return time.Now()
+	}
+	return startedAt
+}
+
 func addAuditRequestDetail(detail map[string]any, capture auditRequestCapture) {
 	if detail == nil {
 		return
@@ -229,6 +268,8 @@ func isNoisySuccessfulAuditRequest(r *http.Request) bool {
 			path == "/api/logs/governance",
 			path == "/api/images/storage-governance",
 			path == "/api/creation-tasks",
+			path == "/api/external-image-tasks",
+			path == "/api/external-chat-conversations",
 			path == "/api/app-meta",
 			path == "/api/admin/permissions",
 			path == "/auth/session":
@@ -249,12 +290,63 @@ func captureAuditRequest(r *http.Request) auditRequestCapture {
 	if r.Method != http.MethodGet && r.Body != nil {
 		body, truncated, ok := captureAuditBody(r)
 		if ok {
+			if r.URL.Path == "/api/external-chat/completions" {
+				return auditRequestCapture{args: combineAuditArgs(query, externalChatAuditPayload(body)), truncated: truncated}
+			}
+			if r.URL.Path == "/api/external-chat-conversations" {
+				return auditRequestCapture{args: combineAuditArgs(query, externalChatHistoryAuditPayload(body)), truncated: truncated}
+			}
 			if bodyPayload := normalizeAuditPayload(body); bodyPayload != nil {
 				return auditRequestCapture{args: combineAuditArgs(query, bodyPayload), truncated: truncated}
 			}
 		}
 	}
 	return auditRequestCapture{args: query}
+}
+
+func externalChatAuditPayload(raw []byte) any {
+	payload := map[string]any{"messages": "[REDACTED]"}
+	var decoded map[string]any
+	if json.Unmarshal(raw, &decoded) != nil {
+		return payload
+	}
+	for _, key := range []string{"provider_id", "model", "temperature", "max_completion_tokens"} {
+		if value, ok := decoded[key]; ok {
+			payload[key] = value
+		}
+	}
+	messages := util.AsMapSlice(decoded["messages"])
+	payload["message_count"] = len(messages)
+	roles := make([]string, 0, len(messages))
+	for _, message := range messages {
+		if role := util.Clean(message["role"]); role != "" {
+			roles = append(roles, role)
+		}
+	}
+	payload["roles"] = roles
+	return service.SanitizeLogValue(payload)
+}
+
+func externalChatHistoryAuditPayload(raw []byte) any {
+	payload := map[string]any{
+		"conversation_count": 0,
+		"message_count":      0,
+	}
+	var decoded struct {
+		Items []struct {
+			Messages []json.RawMessage `json:"messages"`
+		} `json:"items"`
+	}
+	if json.Unmarshal(raw, &decoded) != nil {
+		return payload
+	}
+	payload["conversation_count"] = len(decoded.Items)
+	messageCount := 0
+	for _, item := range decoded.Items {
+		messageCount += len(item.Messages)
+	}
+	payload["message_count"] = messageCount
+	return payload
 }
 
 func captureAuditBody(r *http.Request) ([]byte, bool, bool) {
@@ -363,17 +455,52 @@ func clientIP(r *http.Request) string {
 	if r == nil {
 		return ""
 	}
-	if forwarded := strings.TrimSpace(r.Header.Get("X-Forwarded-For")); forwarded != "" {
-		return strings.TrimSpace(strings.Split(forwarded, ",")[0])
+	peer := remoteAddressIP(r.RemoteAddr)
+	if !trustedProxyPeer(peer) {
+		return peer
 	}
-	if realIP := strings.TrimSpace(r.Header.Get("X-Real-IP")); realIP != "" {
+	if forwarded := strings.TrimSpace(r.Header.Get("X-Forwarded-For")); forwarded != "" {
+		parts := strings.Split(forwarded, ",")
+		for index := len(parts) - 1; index >= 0; index-- {
+			candidate := strings.TrimSpace(parts[index])
+			if net.ParseIP(candidate) == nil {
+				continue
+			}
+			if !trustedProxyPeer(candidate) {
+				return candidate
+			}
+		}
+	}
+	if realIP := strings.TrimSpace(r.Header.Get("X-Real-IP")); net.ParseIP(realIP) != nil {
 		return realIP
 	}
-	host, _, err := net.SplitHostPort(strings.TrimSpace(r.RemoteAddr))
+	return peer
+}
+
+func remoteAddressIP(remoteAddr string) string {
+	remoteAddr = strings.TrimSpace(remoteAddr)
+	host, _, err := net.SplitHostPort(remoteAddr)
 	if err == nil {
 		return host
 	}
-	return util.Clean(r.RemoteAddr)
+	return util.Clean(remoteAddr)
+}
+
+func trustedProxyPeer(peer string) bool {
+	ip := net.ParseIP(strings.TrimSpace(peer))
+	if ip == nil {
+		return false
+	}
+	if ip.IsLoopback() {
+		return true
+	}
+	for _, value := range strings.Split(os.Getenv("TRUSTED_PROXY_CIDRS"), ",") {
+		_, network, err := net.ParseCIDR(strings.TrimSpace(value))
+		if err == nil && network.Contains(ip) {
+			return true
+		}
+	}
+	return false
 }
 
 func parseLogQuery(r *http.Request) (service.LogQuery, error) {

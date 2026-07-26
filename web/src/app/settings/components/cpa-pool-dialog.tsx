@@ -1,8 +1,9 @@
 "use client";
 
-import { Eye, EyeOff, Link2, LoaderCircle, Save, Unplug } from "lucide-react";
+import { Eye, EyeOff, Link2, Save, Unplug } from "lucide-react";
 
 import { Button } from "@/components/ui/button";
+import { ApiLoadingMark } from "@/components/api-loading-mark";
 import {
   Dialog,
   DialogContent,
@@ -116,7 +117,7 @@ export function CPAPoolDialog() {
             disabled={isSavingPool}
           >
             {isSavingPool ? (
-              <LoaderCircle data-icon="inline-start" className="animate-spin" />
+              <ApiLoadingMark size="inline" label="正在保存 CPA 池" />
             ) : (
               <Save data-icon="inline-start" />
             )}

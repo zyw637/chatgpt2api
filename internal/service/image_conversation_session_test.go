@@ -33,7 +33,9 @@ func TestImageConversationSessionServiceScopesBindings(t *testing.T) {
 		UpstreamConversationID:  "conv-a",
 		UpstreamParentMessageID: "msg-a",
 	}
-	svc.Bind(first)
+	if err := svc.Bind(first); err != nil {
+		t.Fatalf("Bind() error = %v", err)
+	}
 
 	if _, ok := svc.Get("owner-b", "frontend-1"); ok {
 		t.Fatal("Get() leaked binding across owners")
@@ -51,8 +53,12 @@ func TestImageConversationSessionServiceOverwriteInvalidateCleanupAndReload(t *t
 	path := filepath.Join(t.TempDir(), "image_conversation_sessions.json")
 	backend := newImageConversationSessionTestBackend(t)
 	svc := NewImageConversationSessionService(path, backend)
-	svc.Bind(ImageConversationSession{OwnerID: "owner", FrontendConversationID: "front", AccessToken: "old", UpstreamConversationID: "conv-old", UpstreamParentMessageID: "msg-old"})
-	svc.Bind(ImageConversationSession{OwnerID: "owner", FrontendConversationID: "front", AccessToken: "new", UpstreamConversationID: "conv-new", UpstreamParentMessageID: "msg-new"})
+	if err := svc.Bind(ImageConversationSession{OwnerID: "owner", FrontendConversationID: "front", AccessToken: "old", UpstreamConversationID: "conv-old", UpstreamParentMessageID: "msg-old"}); err != nil {
+		t.Fatalf("first Bind() error = %v", err)
+	}
+	if err := svc.Bind(ImageConversationSession{OwnerID: "owner", FrontendConversationID: "front", AccessToken: "new", UpstreamConversationID: "conv-new", UpstreamParentMessageID: "msg-new"}); err != nil {
+		t.Fatalf("second Bind() error = %v", err)
+	}
 
 	got, ok := svc.Get("owner", "front")
 	if !ok || got.AccessToken != "new" || got.UpstreamConversationID != "conv-new" || got.UpstreamParentMessageID != "msg-new" {
@@ -65,15 +71,22 @@ func TestImageConversationSessionServiceOverwriteInvalidateCleanupAndReload(t *t
 		t.Fatalf("reloaded binding = %#v ok=%v", reloadedGot, ok)
 	}
 
-	reloaded.Invalidate("owner", "front")
+	if err := reloaded.Invalidate("owner", "front"); err != nil {
+		t.Fatalf("Invalidate() error = %v", err)
+	}
 	invalid, ok := reloaded.Get("owner", "front")
 	if !ok || invalid.Status != ImageConversationSessionFailed {
 		t.Fatalf("invalidated binding = %#v ok=%v", invalid, ok)
 	}
 
 	old := time.Now().Add(-48 * time.Hour)
-	reloaded.Bind(ImageConversationSession{OwnerID: "owner", FrontendConversationID: "old", AccessToken: "token", UpstreamConversationID: "conv", UpstreamParentMessageID: "msg", LastUsedAt: old})
-	removed := reloaded.Cleanup(24 * time.Hour)
+	if err := reloaded.Bind(ImageConversationSession{OwnerID: "owner", FrontendConversationID: "old", AccessToken: "token", UpstreamConversationID: "conv", UpstreamParentMessageID: "msg", LastUsedAt: old}); err != nil {
+		t.Fatalf("expired Bind() error = %v", err)
+	}
+	removed, err := reloaded.Cleanup(24 * time.Hour)
+	if err != nil {
+		t.Fatalf("Cleanup() error = %v", err)
+	}
 	if removed != 1 {
 		t.Fatalf("Cleanup() removed %d, want 1", removed)
 	}

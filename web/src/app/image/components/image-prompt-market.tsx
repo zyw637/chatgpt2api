@@ -1,7 +1,7 @@
 "use client";
 
 import { useEffect, useMemo, useRef, useState } from "react";
-import { ClipboardCopy, ExternalLink, LoaderCircle, RefreshCcw, Search, SlidersHorizontal, Star } from "lucide-react";
+import { ClipboardCopy, ExternalLink, RefreshCcw, Search, SlidersHorizontal, Star } from "lucide-react";
 import { toast } from "sonner";
 
 import {
@@ -25,6 +25,7 @@ import {
   type PromptFavorite,
 } from "@/app/image/prompt-favorites";
 import { Badge } from "@/components/ui/badge";
+import { ApiLoadingMark } from "@/components/api-loading-mark";
 import { Button } from "@/components/ui/button";
 import {
   Dialog,
@@ -666,7 +667,7 @@ export function ImagePromptMarket({ open, onOpenChange, onApplyPrompt }: ImagePr
         <div ref={scrollAreaRef} className="min-h-0 flex-1 overflow-y-auto bg-white px-4 py-3 sm:px-6 sm:py-4">
           {favoriteFilter !== "favorites" && isLoading ? (
             <div className="flex h-full min-h-[320px] flex-col items-center justify-center gap-3 text-[#45515e]">
-              <LoaderCircle className="size-6 animate-spin text-[#1456f0]" />
+              <ApiLoadingMark size="section" label="正在读取远程提示词市场" />
               <p className="text-sm">正在读取远程提示词市场...</p>
             </div>
           ) : favoriteFilter !== "favorites" && error ? (
@@ -684,7 +685,7 @@ export function ImagePromptMarket({ open, onOpenChange, onApplyPrompt }: ImagePr
             </div>
           ) : favoriteFilter === "favorites" && isLoadingFavorites && favoriteItems.length === 0 ? (
             <div className="flex h-full min-h-[320px] flex-col items-center justify-center gap-3 text-[#45515e]">
-              <LoaderCircle className="size-6 animate-spin text-[#1456f0]" />
+              <ApiLoadingMark size="section" label="正在读取收藏提示词" />
               <p className="text-sm">正在读取收藏...</p>
             </div>
           ) : visiblePrompts.length === 0 ? (
@@ -770,7 +771,7 @@ export function ImagePromptMarket({ open, onOpenChange, onApplyPrompt }: ImagePr
                               title={isFavorite ? "取消收藏" : "收藏"}
                             >
                               {isFavoriteBusy ? (
-                                <LoaderCircle className="size-3.5 animate-spin" />
+                                <ApiLoadingMark size="inline" label="正在更新收藏" />
                               ) : (
                                 <Star className={cn("size-3.5", isFavorite && "fill-current")} />
                               )}

@@ -10,7 +10,6 @@ import {
   EyeOff,
   KeyRound,
   LockKeyhole,
-  LoaderCircle,
   RefreshCw,
   RotateCcw,
   Save,
@@ -22,6 +21,7 @@ import {
 import { toast } from "sonner";
 
 import { PageHeader } from "@/components/page-header";
+import { ApiLoadingMark } from "@/components/api-loading-mark";
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
 import { Card, CardContent, CardDescription, CardHeader, CardTitle } from "@/components/ui/card";
@@ -280,7 +280,7 @@ function ProfileContent({ session }: { session: StoredAuthSession }) {
     setIsSavingProfile(true);
     try {
       const data = await updateProfileName(nextName);
-      const nextSession = authSessionFromLoginResponse(data, currentSession.key);
+      const nextSession = authSessionFromLoginResponse(data);
       await setVerifiedAuthSession(nextSession);
       setCurrentSession(nextSession);
       setProfileName(nextSession.name || "");
@@ -307,7 +307,10 @@ function ProfileContent({ session }: { session: StoredAuthSession }) {
     }
     setIsChangingPassword(true);
     try {
-      await changeProfilePassword(currentPassword, newPassword);
+      const data = await changeProfilePassword(currentPassword, newPassword);
+      const nextSession = authSessionFromLoginResponse(data);
+      await setVerifiedAuthSession(nextSession);
+      setCurrentSession(nextSession);
       setCurrentPassword("");
       setNewPassword("");
       setConfirmPassword("");
@@ -481,7 +484,7 @@ function ProfileContent({ session }: { session: StoredAuthSession }) {
                       onClick={() => void handleChangePassword()}
                       disabled={isChangingPassword}
                     >
-                      {isChangingPassword ? <LoaderCircle className="size-4 animate-spin" /> : <Save className="size-4" />}
+                      {isChangingPassword ? <ApiLoadingMark size="inline" label="正在修改密码" /> : <Save className="size-4" />}
                       修改密码
                     </Button>
                   </div>
@@ -527,7 +530,7 @@ function ProfileContent({ session }: { session: StoredAuthSession }) {
                       onClick={() => void handleSaveProfile()}
                       disabled={!isProfileNameDirty || isSavingProfile}
                     >
-                      {isSavingProfile ? <LoaderCircle className="size-4 animate-spin" /> : <Save className="size-4" />}
+                      {isSavingProfile ? <ApiLoadingMark size="inline" label="正在保存资料" /> : <Save className="size-4" />}
                       保存
                     </Button>
                   </div>
@@ -565,7 +568,7 @@ function ProfileContent({ session }: { session: StoredAuthSession }) {
             <CardContent className="flex flex-col gap-5">
             {isLoading ? (
               <div className="flex min-h-[260px] items-center justify-center">
-                <LoaderCircle className="size-5 animate-spin text-stone-400" />
+                <ApiLoadingMark size="section" label="正在加载 API 密钥" />
               </div>
             ) : (
               <>
@@ -587,7 +590,7 @@ function ProfileContent({ session }: { session: StoredAuthSession }) {
                         onClick={() => void handleSaveName()}
                         disabled={!key || !isNameDirty || isSavingName}
                       >
-                        {isSavingName ? <LoaderCircle className="size-4 animate-spin" /> : <Save className="size-4" />}
+                        {isSavingName ? <ApiLoadingMark size="inline" label="正在保存名称" /> : <Save className="size-4" />}
                         保存
                       </Button>
                     </div>
@@ -616,7 +619,7 @@ function ProfileContent({ session }: { session: StoredAuthSession }) {
                         title={revealedKey ? "隐藏" : "查看"}
                       >
                         {isRevealing ? (
-                          <LoaderCircle className="size-4 animate-spin" />
+                          <ApiLoadingMark size="inline" label="正在读取密钥" />
                         ) : revealedKey ? (
                           <EyeOff className="size-4" />
                         ) : (
@@ -656,7 +659,7 @@ function ProfileContent({ session }: { session: StoredAuthSession }) {
                         disabled={isToggling}
                       >
                         {isToggling ? (
-                          <LoaderCircle className="size-4 animate-spin" />
+                          <ApiLoadingMark size="inline" label="正在更新密钥状态" />
                         ) : key.enabled ? (
                           <Ban className="size-4" />
                         ) : (
@@ -687,7 +690,7 @@ function ProfileContent({ session }: { session: StoredAuthSession }) {
                     </>
                   ) : (
                     <Button type="button" className="h-10 rounded-lg" onClick={() => void handleGenerate()} disabled={isGenerating}>
-                      {isGenerating ? <LoaderCircle className="size-4 animate-spin" /> : <KeyRound className="size-4" />}
+                      {isGenerating ? <ApiLoadingMark size="inline" label="正在生成密钥" /> : <KeyRound className="size-4" />}
                       生成密钥
                     </Button>
                   )}
@@ -715,7 +718,7 @@ function ProfileContent({ session }: { session: StoredAuthSession }) {
               取消
             </Button>
             <Button type="button" className="h-10 rounded-xl px-5" onClick={() => void handleGenerate()} disabled={isGenerating}>
-              {isGenerating ? <LoaderCircle className="size-4 animate-spin" /> : <RotateCcw className="size-4" />}
+              {isGenerating ? <ApiLoadingMark size="inline" label="正在重新生成密钥" /> : <RotateCcw className="size-4" />}
               确认
             </Button>
           </DialogFooter>
@@ -735,7 +738,7 @@ function ProfileContent({ session }: { session: StoredAuthSession }) {
               取消
             </Button>
             <Button type="button" variant="destructive" className="h-10 rounded-xl px-5" onClick={() => void handleDelete()} disabled={isDeleting}>
-              {isDeleting ? <LoaderCircle className="size-4 animate-spin" /> : <Trash2 className="size-4" />}
+              {isDeleting ? <ApiLoadingMark size="inline" label="正在删除密钥" /> : <Trash2 className="size-4" />}
               删除
             </Button>
           </DialogFooter>
@@ -750,7 +753,7 @@ export default function ProfilePage() {
   if (isCheckingAuth || !session) {
     return (
       <div className="flex min-h-[40vh] items-center justify-center">
-        <LoaderCircle className="size-5 animate-spin text-stone-400" />
+        <ApiLoadingMark size="page" label="正在验证登录状态" />
       </div>
     );
   }

@@ -2,10 +2,11 @@
 
 import { useEffect, useState } from "react";
 import { useNavigate } from "react-router-dom";
-import { AlertCircle, LoaderCircle } from "lucide-react";
+import { AlertCircle } from "lucide-react";
 import { toast } from "sonner";
 
 import { Button } from "@/components/ui/button";
+import { ApiLoadingMark } from "@/components/api-loading-mark";
 import { Card, CardContent } from "@/components/ui/card";
 import { verifySession } from "@/lib/api";
 import { authSessionFromLoginResponse, clearVerifiedAuthSession, setVerifiedAuthSession } from "@/lib/session";
@@ -55,18 +56,9 @@ export default function LinuxDoCallbackPage() {
         return;
       }
 
-      const key = params.get("key") || "";
-      if (!key) {
-        await clearVerifiedAuthSession();
-        if (active) {
-          setErrorMessage("Linuxdo 登录回调缺少本地会话密钥");
-        }
-        return;
-      }
-
       try {
-        const data = await verifySession(key);
-        const session = authSessionFromLoginResponse(data, key);
+        const data = await verifySession();
+        const session = authSessionFromLoginResponse(data);
         await setVerifiedAuthSession(session);
         toast.success("登录成功");
         const redirect = sanitizeRedirectPath(params.get("redirect")) || getDefaultRouteForSession(session);
@@ -103,7 +95,7 @@ export default function LinuxDoCallbackPage() {
             </>
           ) : (
             <>
-              <LoaderCircle className="size-6 animate-spin text-stone-400" />
+              <ApiLoadingMark size="page" label="正在完成 Linuxdo 登录" />
               <div className="space-y-2">
                 <h1 className="text-xl font-semibold">正在完成 Linuxdo 登录</h1>
                 <p className="text-sm text-stone-500">请稍候。</p>

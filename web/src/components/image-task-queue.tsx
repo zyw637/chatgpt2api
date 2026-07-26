@@ -16,6 +16,7 @@ import {
   listImageConversations,
   getImageTurnLoadingCounts,
   getImageTurnLoadingPhase,
+  isImageTurnInFlight,
   type ImageConversation,
   type ImageConversationMode,
   type ImageTurn,
@@ -48,11 +49,7 @@ type RecentQueueCompletion = TaskQueueItem & {
 };
 
 function isTurnBusy(turn: ImageTurn) {
-  return (
-    turn.status === "queued" ||
-    turn.status === "generating" ||
-    turn.images.some((image) => image.status === "loading")
-  );
+  return isImageTurnInFlight(turn);
 }
 
 function isTerminalTurnStatus(status: ImageTurnStatus) {
@@ -156,9 +153,12 @@ function getQueueLoadingDetail(item: TaskQueueItem, loadingPhase: ImageTurnLoadi
     return "";
   }
   if (loadingPhase === "queued") {
-    return `还有 ${item.queuedCount} 张图片排队中`;
+    return `还有 ${item.queuedCount} 张图片待处理`;
   }
   if (loadingPhase === "running") {
+    if (item.queuedCount > 0) {
+      return `${item.runningCount} 张处理中，${item.queuedCount} 张待处理`;
+    }
     return `还有 ${item.runningCount} 张图片处理中`;
   }
   return "";

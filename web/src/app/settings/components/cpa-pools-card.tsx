@@ -2,7 +2,6 @@
 
 import {
   Import,
-  LoaderCircle,
   Pencil,
   Plus,
   ServerCog,
@@ -10,6 +9,7 @@ import {
 } from "lucide-react";
 
 import { Badge } from "@/components/ui/badge";
+import { ApiLoadingMark } from "@/components/api-loading-mark";
 import { Button } from "@/components/ui/button";
 
 import { useSettingsStore } from "../store";
@@ -47,7 +47,7 @@ export function CPAPoolsCard() {
       <div className="flex flex-col gap-6">
         {isLoadingPools ? (
           <div className="flex items-center justify-center py-10">
-            <LoaderCircle className="size-5 animate-spin text-muted-foreground" />
+            <ApiLoadingMark size="section" label="正在加载 CPA 池" />
           </div>
         ) : pools.length === 0 ? (
           <SettingsEmptyState
@@ -100,7 +100,7 @@ export function CPAPoolsCard() {
                         title="删除"
                       >
                         {deletingId === pool.id ? (
-                          <LoaderCircle className="animate-spin" />
+                          <ApiLoadingMark size="inline" label="正在删除 CPA 池" />
                         ) : (
                           <Trash2 />
                         )}
@@ -116,10 +116,7 @@ export function CPAPoolsCard() {
                       disabled={isBusy}
                     >
                       {loadingFilesId === pool.id ? (
-                        <LoaderCircle
-                          data-icon="inline-start"
-                          className="animate-spin"
-                        />
+                        <ApiLoadingMark size="inline" label="正在读取 CPA 文件" />
                       ) : (
                         <Import data-icon="inline-start" />
                       )}

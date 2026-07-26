@@ -4,6 +4,8 @@ import (
 	"net"
 	"net/http"
 	"net/url"
+	"os"
+	"path"
 	"strings"
 
 	"chatgpt2api/internal/util"
@@ -68,7 +70,13 @@ func (a *App) routes() []appRoute {
 		subtree("/api/cpa/pools", a.handleCPA),
 		subtree("/api/sub2api/servers", a.handleSub2API),
 		subtree("/api/creation-tasks", a.handleCreationTasks),
-		subtree("/api/register", a.handleRegister),
+		exact(http.MethodGet, "/api/external-chat-providers", a.handleExternalChatProviders),
+		exact(http.MethodPost, "/api/external-chat/completions", a.handleExternalChatCompletions),
+		exact("", "/api/external-chat-conversations", a.handleExternalChatConversations),
+		exact("", "/api/image-conversations", a.handleImageConversations),
+		subtree("/api/external-image-providers", a.handleExternalImageProviders),
+		subtree("/api/external-image-tasks", a.handleExternalImageTasks),
+		subtree("/api/admin/external-image-providers", a.handleAdminExternalImageProviders),
 		exact("", "/api/settings", a.handleSettings),
 		exact("", "/api/settings/login-page-image", a.handleLoginPageImageSettings),
 		exact(http.MethodGet, "/api/app-meta", a.handleAppMeta),
@@ -85,7 +93,7 @@ func (a *App) routes() []appRoute {
 		prefix("/images/", a.handleImageFile),
 		prefix("/image-references/", a.handleImageReferenceFile),
 		prefix("/image-thumbnails/", a.handleImageThumbnail),
-		prefix("/login-page-images/", http.StripPrefix("/login-page-images/", http.FileServer(http.Dir(a.config.LoginPageImagesDir()))).ServeHTTP),
+		prefix("/login-page-images/", a.handleLoginPageImageFile),
 	}
 }
 
@@ -146,7 +154,7 @@ func isAPISpace(path string) bool {
 
 func applyCORS(w http.ResponseWriter, r *http.Request) {
 	origin := strings.TrimSpace(r.Header.Get("Origin"))
-	if origin != "" && isAllowedCredentialedOrigin(origin, r.Host) {
+	if origin != "" && isAllowedCredentialedOrigin(origin, r) {
 		w.Header().Set("Access-Control-Allow-Origin", origin)
 		w.Header().Set("Access-Control-Allow-Credentials", "true")
 		w.Header().Add("Vary", "Origin")
@@ -167,19 +175,44 @@ func applyCORS(w http.ResponseWriter, r *http.Request) {
 	}
 }
 
-func isAllowedCredentialedOrigin(origin, requestHost string) bool {
+func isAllowedCredentialedOrigin(origin string, r *http.Request) bool {
 	originURL, err := url.Parse(origin)
-	if err != nil || originURL.Scheme == "" || originURL.Hostname() == "" {
+	if err != nil || originURL.Scheme == "" || originURL.Hostname() == "" || originURL.Path != "" {
 		return false
+	}
+	requestHost := strings.TrimSpace(r.Host)
+	requestScheme := "http"
+	if isHTTPSRequest(r) {
+		requestScheme = "https"
+	}
+	if strings.EqualFold(originURL.Scheme, requestScheme) && strings.EqualFold(originURL.Host, requestHost) {
+		return true
+	}
+	for _, allowed := range strings.Split(os.Getenv("CORS_ALLOWED_ORIGINS"), ",") {
+		if strings.EqualFold(strings.TrimRight(strings.TrimSpace(allowed), "/"), strings.TrimRight(origin, "/")) {
+			return true
+		}
 	}
 	requestHostname := requestHost
 	if host, _, err := net.SplitHostPort(requestHost); err == nil {
 		requestHostname = host
 	}
 	requestHostname = strings.Trim(requestHostname, "[]")
-	originHostname := originURL.Hostname()
-	return strings.EqualFold(originHostname, requestHostname) ||
-		isLoopbackHostname(originHostname) && isLoopbackHostname(requestHostname)
+	if !isLoopbackHostname(requestHostname) || !isLoopbackHostname(originURL.Hostname()) || originURL.Scheme != "http" {
+		return false
+	}
+	_, port, err := net.SplitHostPort(originURL.Host)
+	return err == nil && port == "5173"
+}
+
+func (a *App) handleLoginPageImageFile(w http.ResponseWriter, r *http.Request) {
+	if strings.EqualFold(path.Ext(r.URL.Path), ".svg") {
+		http.NotFound(w, r)
+		return
+	}
+	w.Header().Set("Content-Security-Policy", "default-src 'none'; sandbox")
+	w.Header().Set("X-Content-Type-Options", "nosniff")
+	http.StripPrefix("/login-page-images/", http.FileServer(http.Dir(a.config.LoginPageImagesDir()))).ServeHTTP(w, r)
 }
 
 func isLoopbackHostname(hostname string) bool {

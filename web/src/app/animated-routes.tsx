@@ -1,4 +1,4 @@
-import type { ReactNode } from "react";
+import { Suspense, type ReactNode } from "react";
 import {
   Navigate,
   Route,
@@ -16,6 +16,8 @@ import {
 import { appRoutes } from "@/app/route-config";
 import { getCachedAuthSession } from "@/lib/session";
 import { canAccessPath, getDefaultRouteForSession } from "@/store/auth";
+import { ApiLoadingMark } from "@/components/api-loading-mark";
+import { cn } from "@/lib/utils";
 
 const routeTransition: Transition = {
   duration: 0.2,
@@ -61,7 +63,15 @@ function PermissionRoute({ requiredPath, children }: { requiredPath?: string; ch
   return children;
 }
 
-export function AnimatedRoutes() {
+function RouteLoading() {
+  return (
+    <div className="flex min-h-[60vh] items-center justify-center">
+      <ApiLoadingMark size="page" label="正在切换页面" />
+    </div>
+  );
+}
+
+export function AnimatedRoutes({ fill = false }: { fill?: boolean }) {
   const location = useLocation();
   const prefersReducedMotion = useReducedMotion();
 
@@ -74,17 +84,19 @@ export function AnimatedRoutes() {
         animate="animate"
         exit="exit"
         transition={prefersReducedMotion ? reducedRouteTransition : routeTransition}
-        className="min-w-0"
+        className={cn("min-w-0", fill && "h-full min-h-0")}
       >
-        <Routes location={location}>
-          {appRoutes.map((route) => (
-            <Route
-              key={route.path}
-              path={route.path}
-              element={<PermissionRoute requiredPath={route.requiredPath}>{route.element}</PermissionRoute>}
-            />
-          ))}
-        </Routes>
+        <Suspense fallback={<RouteLoading />}>
+          <Routes location={location}>
+            {appRoutes.map((route) => (
+              <Route
+                key={route.path}
+                path={route.path}
+                element={<PermissionRoute requiredPath={route.requiredPath}>{route.element}</PermissionRoute>}
+              />
+            ))}
+          </Routes>
+        </Suspense>
       </motion.div>
     </AnimatePresence>
   );

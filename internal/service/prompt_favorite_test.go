@@ -45,11 +45,14 @@ func TestPromptFavoriteServiceUpsertListAndDelete(t *testing.T) {
 		t.Fatalf("localizations were not normalized: %#v", item["localizations"])
 	}
 
-	items := service.List("user_1")
+	items, err := service.List("user_1")
+	if err != nil {
+		t.Fatalf("List() error = %v", err)
+	}
 	if len(items) != 1 || items[0]["title"] != "Prompt A" {
 		t.Fatalf("List() = %#v", items)
 	}
-	if otherItems := service.List("user_2"); len(otherItems) != 0 {
+	if otherItems, err := service.List("user_2"); err != nil || len(otherItems) != 0 {
 		t.Fatalf("other owner saw favorites: %#v", otherItems)
 	}
 
@@ -70,18 +73,22 @@ func TestPromptFavoriteServiceUpsertListAndDelete(t *testing.T) {
 	if updated["id"] != item["id"] || updated["favorited_at"] != item["favorited_at"] {
 		t.Fatalf("duplicate upsert changed identity fields: first=%#v second=%#v", item, updated)
 	}
-	items = service.List("user_1")
+	items, err = service.List("user_1")
+	if err != nil {
+		t.Fatalf("List() error = %v", err)
+	}
 	if len(items) != 1 || items[0]["title"] != "Prompt A Updated" {
 		t.Fatalf("duplicate upsert did not update in place: %#v", items)
 	}
 
-	if !service.Delete("user_1", item["id"].(string)) {
+	deleted, err := service.Delete("user_1", item["id"].(string))
+	if err != nil || !deleted {
 		t.Fatal("Delete() returned false")
 	}
-	if items = service.List("user_1"); len(items) != 0 {
+	if items, err = service.List("user_1"); err != nil || len(items) != 0 {
 		t.Fatalf("favorite remained after delete: %#v", items)
 	}
-	if service.Delete("user_1", item["id"].(string)) {
+	if deleted, err = service.Delete("user_1", item["id"].(string)); err != nil || deleted {
 		t.Fatal("Delete() returned true for missing favorite")
 	}
 }

@@ -107,6 +107,7 @@ type BillingService struct {
 	states       map[string]map[string]any
 	adjustments  []map[string]any
 	transactions []map[string]any
+	initErr      error
 }
 
 func NewBillingService(backend storage.Backend, defaults BillingDefaults) *BillingService {
@@ -116,18 +117,23 @@ func NewBillingService(backend storage.Backend, defaults BillingDefaults) *Billi
 		states:   map[string]map[string]any{},
 	}
 	s.mu.Lock()
-	s.loadLocked()
+	s.initErr = s.loadLocked()
 	s.mu.Unlock()
 	return s
 }
 
-func (s *BillingService) InitializeUserDefaults(userID string) map[string]any {
+func (s *BillingService) InitializationError() error {
+	return s.initErr
+}
+
+func (s *BillingService) InitializeUserDefaults(userID string) (map[string]any, error) {
 	userID = strings.TrimSpace(userID)
 	if s == nil || userID == "" {
-		return nil
+		return nil, nil
 	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	snapshot := s.snapshotLocked()
 	if s.states == nil {
 		s.states = map[string]map[string]any{}
 	}
@@ -141,9 +147,12 @@ func (s *BillingService) InitializeUserDefaults(userID string) map[string]any {
 		changed = normalizeBillingState(state, userID, nil)
 	}
 	if changed {
-		_ = s.saveLocked()
+		if err := s.saveLocked(); err != nil {
+			s.restoreLocked(snapshot)
+			return nil, fmt.Errorf("persist billing defaults for user %s: %w", userID, err)
+		}
 	}
-	return publicBillingState(state)
+	return publicBillingState(state), nil
 }
 
 func (s *BillingService) Get(userID string) map[string]any {
@@ -153,6 +162,7 @@ func (s *BillingService) Get(userID string) map[string]any {
 	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	snapshot := s.snapshotLocked()
 	state, ok := s.stateForReadLocked(userID)
 	if !ok {
 		return publicBillingState(legacyBillingState(userID))
@@ -165,7 +175,10 @@ func (s *BillingService) Get(userID string) map[string]any {
 		changed = true
 	}
 	if changed {
-		_ = s.saveLocked()
+		if err := s.saveLocked(); err != nil {
+			s.restoreLocked(snapshot)
+			return publicBillingState(s.states[userID])
+		}
 	}
 	return publicBillingState(state)
 }
@@ -177,6 +190,7 @@ func (s *BillingService) GetMany(userIDs []string) map[string]map[string]any {
 	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	snapshot := s.snapshotLocked()
 	changed := false
 	now := time.Now()
 	for _, userID := range userIDs {
@@ -198,7 +212,21 @@ func (s *BillingService) GetMany(userIDs []string) map[string]map[string]any {
 		out[userID] = publicBillingState(state)
 	}
 	if changed {
-		_ = s.saveLocked()
+		if err := s.saveLocked(); err != nil {
+			s.restoreLocked(snapshot)
+			out = map[string]map[string]any{}
+			for _, userID := range userIDs {
+				userID = strings.TrimSpace(userID)
+				if userID == "" {
+					continue
+				}
+				if state, ok := s.stateForReadLocked(userID); ok {
+					out[userID] = publicBillingState(state)
+				} else {
+					out[userID] = publicBillingState(legacyBillingState(userID))
+				}
+			}
+		}
 	}
 	return out
 }
@@ -217,10 +245,12 @@ func (s *BillingService) CheckAvailable(identity Identity, amount int) error {
 	if s.resetSubscriptionIfDueLocked(state, time.Now()) {
 		changed = true
 	}
-	if util.ToBool(state["unlimited"]) {
-		if changed {
-			_ = s.saveLocked()
+	if changed {
+		if err := s.saveLocked(); err != nil {
+			return fmt.Errorf("persist billing state: %w", err)
 		}
+	}
+	if util.ToBool(state["unlimited"]) {
 		return nil
 	}
 	billingType := normalizeBillingType(util.Clean(state["billing_type"]))
@@ -228,24 +258,15 @@ func (s *BillingService) CheckAvailable(identity Identity, amount int) error {
 	case BillingTypeStandard:
 		standard := billingStandardState(state)
 		if availableStandardBalance(standard) < amount {
-			if changed {
-				_ = s.saveLocked()
-			}
 			return NewBillingLimitError(BillingTypeStandard)
 		}
 	case BillingTypeSubscription:
 		subscription := billingSubscriptionState(state)
 		if availableSubscriptionQuota(subscription) < amount {
-			if changed {
-				_ = s.saveLocked()
-			}
 			return NewBillingLimitError(BillingTypeSubscription)
 		}
 	default:
 		return fmt.Errorf("unsupported billing type: %s", billingType)
-	}
-	if changed {
-		_ = s.saveLocked()
 	}
 	return nil
 }
@@ -269,10 +290,14 @@ func (s *BillingService) chargeUserID(userID string, amount int, ref BillingRefe
 	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	snapshot := s.snapshotLocked()
 	state, _ := s.ensureStateLocked(userID)
 	s.resetSubscriptionIfDueLocked(state, time.Now())
 	if util.ToBool(state["unlimited"]) {
-		_ = s.saveLocked()
+		if err := s.saveLocked(); err != nil {
+			s.restoreLocked(snapshot)
+			return result, err
+		}
 		result.Billing = publicBillingState(state)
 		return result, nil
 	}
@@ -317,7 +342,8 @@ func (s *BillingService) chargeUserID(userID string, amount int, ref BillingRefe
 	result.Charged = true
 	result.Billing = publicBillingState(state)
 	if err := s.saveLocked(); err != nil {
-		return result, err
+		s.restoreLocked(snapshot)
+		return BillingChargeResult{}, err
 	}
 	return result, nil
 }
@@ -330,6 +356,7 @@ func (s *BillingService) RefundUserID(userID string, amount int, ref BillingRefe
 	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	snapshot := s.snapshotLocked()
 	state, _ := s.ensureStateLocked(userID)
 	s.resetSubscriptionIfDueLocked(state, time.Now())
 	if util.ToBool(state["unlimited"]) {
@@ -378,7 +405,8 @@ func (s *BillingService) RefundUserID(userID string, amount int, ref BillingRefe
 	result.Refunded = true
 	result.Billing = publicBillingState(state)
 	if err := s.saveLocked(); err != nil {
-		return result, err
+		s.restoreLocked(snapshot)
+		return BillingRefundResult{}, err
 	}
 	return result, nil
 }
@@ -396,6 +424,7 @@ func (s *BillingService) ApplyAdjustment(userID string, operator Identity, body 
 
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	snapshot := s.snapshotLocked()
 	state, _ := s.ensureStateLocked(userID)
 	now := time.Now()
 	s.resetSubscriptionIfDueLocked(state, now)
@@ -403,6 +432,7 @@ func (s *BillingService) ApplyAdjustment(userID string, operator Identity, body 
 	amount := adjustmentAmount(body)
 
 	if err := s.applyAdjustmentLocked(state, adjustmentType, amount, body, now); err != nil {
+		s.restoreLocked(snapshot)
 		return nil, err
 	}
 
@@ -412,6 +442,7 @@ func (s *BillingService) ApplyAdjustment(userID string, operator Identity, body 
 	after := publicBillingState(state)
 	adjustment := s.addAdjustmentLocked(userID, operator, adjustmentType, amount, reason, before, after)
 	if err := s.saveLocked(); err != nil {
+		s.restoreLocked(snapshot)
 		return nil, err
 	}
 	return map[string]any{"billing": after, "adjustment": adjustment}, nil
@@ -447,6 +478,7 @@ func (s *BillingService) ApplyBulkAdjustment(userIDs []string, operator Identity
 
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	snapshot := s.snapshotLocked()
 	for _, userID := range ids {
 		result := BillingBulkAdjustmentResult{UserID: userID}
 		state, _ := s.ensureStateLocked(userID)
@@ -470,6 +502,7 @@ func (s *BillingService) ApplyBulkAdjustment(userIDs []string, operator Identity
 	}
 	if changed {
 		if err := s.saveLocked(); err != nil {
+			s.restoreLocked(snapshot)
 			return results, err
 		}
 	}
@@ -660,8 +693,14 @@ func (s *BillingService) resetSubscriptionIfDueLocked(state map[string]any, now 
 	return true
 }
 
-func (s *BillingService) loadLocked() {
-	raw := loadStoredJSON(s.store, billingDocumentName)
+func (s *BillingService) loadLocked() error {
+	if s.store == nil {
+		return errors.New("billing document backend is required")
+	}
+	raw, err := s.store.LoadJSONDocument(billingDocumentName)
+	if err != nil {
+		return err
+	}
 	doc, _ := raw.(map[string]any)
 	s.states = map[string]map[string]any{}
 	if states, ok := doc["states"].(map[string]any); ok {
@@ -680,6 +719,7 @@ func (s *BillingService) loadLocked() {
 	if s.transactions == nil {
 		s.transactions = []map[string]any{}
 	}
+	return nil
 }
 
 func (s *BillingService) saveLocked() error {
@@ -699,6 +739,38 @@ func (s *BillingService) saveLocked() error {
 		"updated_at":   util.NowISO(),
 	}
 	return saveStoredJSON(s.store, billingDocumentName, doc)
+}
+
+type billingSnapshot struct {
+	states       map[string]map[string]any
+	adjustments  []map[string]any
+	transactions []map[string]any
+}
+
+func (s *BillingService) snapshotLocked() billingSnapshot {
+	states := make(map[string]map[string]any, len(s.states))
+	for userID, state := range s.states {
+		states[userID] = copyBillingMap(state)
+	}
+	return billingSnapshot{
+		states:       states,
+		adjustments:  copyBillingItems(s.adjustments),
+		transactions: copyBillingItems(s.transactions),
+	}
+}
+
+func (s *BillingService) restoreLocked(snapshot billingSnapshot) {
+	s.states = snapshot.states
+	s.adjustments = snapshot.adjustments
+	s.transactions = snapshot.transactions
+}
+
+func copyBillingItems(items []map[string]any) []map[string]any {
+	out := make([]map[string]any, len(items))
+	for index, item := range items {
+		out[index] = copyBillingMap(item)
+	}
+	return out
 }
 
 func (s *BillingService) addTransactionLocked(item map[string]any) {

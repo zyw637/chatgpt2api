@@ -3,7 +3,6 @@
 import type { ReactNode } from "react";
 import {
   CircleHelp,
-  LoaderCircle,
   PlugZap,
   Save,
   Settings2,
@@ -12,6 +11,7 @@ import { useState } from "react";
 import { toast } from "sonner";
 
 import { Button } from "@/components/ui/button";
+import { ApiLoadingMark } from "@/components/api-loading-mark";
 import { Checkbox } from "@/components/ui/checkbox";
 import { Field, FieldLabel } from "@/components/ui/field";
 import { Input } from "@/components/ui/input";
@@ -235,7 +235,7 @@ export function ConfigCard() {
         description="调整账号刷新、代理和图片任务。"
       >
         <div className="flex items-center justify-center py-10">
-          <LoaderCircle className="size-5 animate-spin text-muted-foreground" />
+          <ApiLoadingMark size="section" label="正在加载系统配置" />
         </div>
       </SettingsCard>
     );
@@ -253,7 +253,7 @@ export function ConfigCard() {
           disabled={isSavingConfig}
         >
           {isSavingConfig ? (
-            <LoaderCircle data-icon="inline-start" className="animate-spin" />
+            <ApiLoadingMark size="inline" label="正在保存系统配置" />
           ) : (
             <Save data-icon="inline-start" />
           )}
@@ -478,10 +478,7 @@ export function ConfigCard() {
                 disabled={isTestingProxy}
               >
                 {isTestingProxy ? (
-                  <LoaderCircle
-                    data-icon="inline-start"
-                    className="animate-spin"
-                  />
+                  <ApiLoadingMark size="inline" label="正在测试代理" />
                 ) : (
                   <PlugZap data-icon="inline-start" />
                 )}

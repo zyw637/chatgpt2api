@@ -7,6 +7,7 @@ import { toast } from "sonner";
 
 import { writeSimilarImageIntent } from "@/app/image/similar-image-intent";
 import { AuthenticatedImage } from "@/components/authenticated-image";
+import { ApiLoadingMark } from "@/components/api-loading-mark";
 import { DateRangeFilter } from "@/components/date-range-filter";
 import { ImageLightbox } from "@/components/image-lightbox";
 import { PageHeader } from "@/components/page-header";
@@ -118,6 +119,7 @@ type PublishRecipeOptions = {
 };
 
 type ImageVisibilityFilter = "all" | ImageVisibility;
+type ImageSourceFilter = "all" | "creation" | "external_api";
 type ImageFormatFilter = "all" | "png" | "jpg" | "webp" | "gif" | "other";
 type ImageOrientationFilter = "all" | "landscape" | "portrait" | "square" | "unknown";
 type ImageResolutionFilter = "all" | "1080p" | "2k" | "4k" | "unknown";
@@ -144,7 +146,7 @@ const IMAGE_ASPECT_RATIO_FILTERS: Array<{ value: ImageAspectRatioFilter; label: 
 ];
 
 function imageManagerCacheScope(session: StoredAuthSession) {
-  return [session.provider || "local", session.role, session.subjectId || session.key].join(":");
+  return [session.provider || "local", session.role, session.subjectId].join(":");
 }
 
 function getManagedImageFormat(item: ManagedImage) {
@@ -347,6 +349,10 @@ function matchesManagedImageKeyword(item: ManagedImage, keyword: string) {
     item.owner_id,
     item.prompt,
     item.model,
+    item.provider_name,
+    item.provider_id,
+    item.protocol,
+    item.revised_prompt,
     item.quality,
     item.output_format,
     item.created_at,
@@ -430,12 +436,14 @@ function useOrderedImageMasonryColumns(items: ManagedImage[]) {
 function ImageManagerContent({
   cacheScope,
   canDeleteImages,
-  canGenerateSimilar,
+  canGenerateCreationSimilar,
+  canGenerateExternalSimilar,
   isAdmin,
 }: {
   cacheScope: string;
   canDeleteImages: boolean;
-  canGenerateSimilar: boolean;
+  canGenerateCreationSimilar: boolean;
+  canGenerateExternalSimilar: boolean;
   isAdmin: boolean;
 }) {
   const navigate = useNavigate();
@@ -475,6 +483,7 @@ function ImageManagerContent({
   const [isLoadingMore, setIsLoadingMore] = useState(false);
   const [searchKeyword, setSearchKeyword] = useState("");
   const [visibilityFilter, setVisibilityFilter] = useState<ImageVisibilityFilter>("all");
+  const [sourceFilter, setSourceFilter] = useState<ImageSourceFilter>("all");
   const [formatFilter, setFormatFilter] = useState<ImageFormatFilter>("all");
   const [orientationFilter, setOrientationFilter] = useState<ImageOrientationFilter>("all");
   const [resolutionFilter, setResolutionFilter] = useState<ImageResolutionFilter>("all");
@@ -486,6 +495,9 @@ function ImageManagerContent({
           return false;
         }
         if (visibilityFilter !== "all" && item.visibility !== visibilityFilter) {
+          return false;
+        }
+        if (sourceFilter !== "all" && (item.source || "creation") !== sourceFilter) {
           return false;
         }
         if (formatFilter !== "all" && getManagedImageFormat(item) !== formatFilter) {
@@ -502,11 +514,12 @@ function ImageManagerContent({
         }
         return true;
       }),
-    [aspectRatioFilter, formatFilter, items, orientationFilter, resolutionFilter, searchKeyword, visibilityFilter],
+    [aspectRatioFilter, formatFilter, items, orientationFilter, resolutionFilter, searchKeyword, sourceFilter, visibilityFilter],
   );
   const hasLocalFilters =
     searchKeyword.trim() !== "" ||
     visibilityFilter !== "all" ||
+    sourceFilter !== "all" ||
     formatFilter !== "all" ||
     orientationFilter !== "all" ||
     resolutionFilter !== "all" ||
@@ -515,6 +528,7 @@ function ImageManagerContent({
   const activeFilterLabels = [
     startDate && endDate ? `${startDate} 至 ${endDate}` : startDate ? startDate : "",
     visibilityFilter !== "all" ? imageVisibilityFilterLabel(visibilityFilter) : "",
+    sourceFilter === "creation" ? "创作台" : sourceFilter === "external_api" ? "API 生图" : "",
     formatFilter !== "all" ? imageFormatFilterLabel(formatFilter) : "",
     orientationFilter !== "all" ? imageOrientationFilterLabel(orientationFilter) : "",
     resolutionFilter !== "all" ? imageResolutionFilterLabel(resolutionFilter) : "",
@@ -702,6 +716,12 @@ function ImageManagerContent({
     setVisibleItemLimit(IMAGE_MANAGER_BATCH_SIZE);
   };
 
+  const updateSourceFilter = (value: ImageSourceFilter) => {
+    setSourceFilter(value);
+    setSelectedImageIds({});
+    setVisibleItemLimit(IMAGE_MANAGER_BATCH_SIZE);
+  };
+
   const updateFormatFilter = (value: ImageFormatFilter) => {
     setFormatFilter(value);
     setSelectedImageIds({});
@@ -731,6 +751,7 @@ function ImageManagerContent({
     setEndDate("");
     setSearchKeyword("");
     setVisibilityFilter("all");
+    setSourceFilter("all");
     setFormatFilter("all");
     setOrientationFilter("all");
     setResolutionFilter("all");
@@ -795,8 +816,9 @@ function ImageManagerContent({
   };
 
   const handleGenerateSimilar = (item: ManagedImage) => {
-    if (!canGenerateSimilar) {
-      toast.error("当前账号没有创作台权限");
+    const external = item.source === "external_api";
+    if (external ? !canGenerateExternalSimilar : !canGenerateCreationSimilar) {
+      toast.error(external ? "当前账号没有 API 生图权限" : "当前账号没有创作台权限");
       return;
     }
     const sourceImageUrls = reusableImageReferenceUrls(item);
@@ -812,8 +834,11 @@ function ImageManagerContent({
       resolutionPreset: item.share_prompt_parameters ? item.resolution_preset : undefined,
       outputFormat: item.share_prompt_parameters ? item.output_format : undefined,
       outputCompression: item.share_prompt_parameters ? item.output_compression : undefined,
+      providerId: external ? item.provider_id : undefined,
+      providerName: external ? item.provider_name : undefined,
+      protocol: external ? item.protocol : undefined,
     });
-    navigate("/image");
+    navigate(external ? "/external-image" : "/image");
     toast.success(sourceImageUrls[0] === item.url ? "已使用公开图准备同款生成" : "已带入公开的原始参考图和生成参数");
   };
 
@@ -1098,6 +1123,10 @@ function ImageManagerContent({
 
   const renderFilterControls = () => (
     <>
+      <Select value={sourceFilter} onValueChange={(value) => updateSourceFilter(value as ImageSourceFilter)}>
+        <SelectTrigger className="h-10 min-w-0 rounded-lg"><SelectValue /></SelectTrigger>
+        <SelectContent><SelectGroup><SelectItem value="all">全部来源</SelectItem><SelectItem value="creation">创作台</SelectItem><SelectItem value="external_api">API 生图</SelectItem></SelectGroup></SelectContent>
+      </Select>
       <Select value={visibilityFilter} onValueChange={(value) => updateVisibilityFilter(value as ImageVisibilityFilter)}>
         <SelectTrigger className="h-10 min-w-0 rounded-lg">
           <SelectValue />
@@ -1425,7 +1454,7 @@ function ImageManagerContent({
                       onClick={() => void handleBulkVisibilityChange(selectedPrivateItems, "public")}
                     >
                       {visibilityMutatingPath === "bulk:public" ? (
-                        <LoaderCircle className="size-4 animate-spin" />
+                        <ApiLoadingMark size="inline" label="正在公开图片" />
                       ) : (
                         <Globe2 className="size-4" />
                       )}
@@ -1439,7 +1468,7 @@ function ImageManagerContent({
                       onClick={() => void handleBulkVisibilityChange(selectedPublicItems, "private")}
                     >
                       {visibilityMutatingPath === "bulk:private" ? (
-                        <LoaderCircle className="size-4 animate-spin" />
+                        <ApiLoadingMark size="inline" label="正在设为私有" />
                       ) : (
                         <Lock className="size-4" />
                       )}
@@ -1509,7 +1538,7 @@ function ImageManagerContent({
           <Card className="overflow-hidden rounded-[20px]">
             <CardContent className="flex min-h-[280px] flex-col items-center justify-center gap-3 px-6 py-14 text-center">
               <div className="rounded-[16px] bg-[#edf4ff] p-4 text-[#1456f0] ring-1 ring-blue-100">
-                <LoaderCircle className="size-7 animate-spin" />
+                <ApiLoadingMark size="section" label="正在加载图片库" />
               </div>
               <div className="space-y-1">
                 <p className="text-sm font-medium text-foreground">正在加载图片</p>
@@ -1637,7 +1666,7 @@ function ImageManagerContent({
                         <Eye className="size-3" />
                         View Original
                       </button>
-                      {galleryView === "public" && canGenerateSimilar ? (
+                      {galleryView === "public" && (item.source === "external_api" ? canGenerateExternalSimilar : canGenerateCreationSimilar) ? (
                         <button
                           type="button"
                           onClick={(event) => {
@@ -1679,13 +1708,14 @@ function ImageManagerContent({
                           title="删除图片"
                         >
                           {isDeleting && deleteTarget?.paths.includes(item.path) ? (
-                            <LoaderCircle className="size-3.5 animate-spin" />
+                            <ApiLoadingMark size="inline" label="正在删除图片" />
                           ) : (
                             <Trash2 className="size-3.5" />
                           )}
                         </button>
                       ) : null}
                     </div>
+                    <div className={cn("pointer-events-none absolute top-2 left-10 z-10 rounded-full px-2 py-1 text-[10px] font-semibold shadow-sm backdrop-blur", item.source === "external_api" ? "bg-[#1456f0]/90 text-white" : "bg-white/90 text-stone-700")}>{item.source === "external_api" ? "API 生图" : "创作台"}</div>
                     <div className="absolute right-2 bottom-2 left-2 z-20 flex items-center justify-between gap-2">
                       <div
                         className="pointer-events-none inline-flex h-7 min-w-0 max-w-[min(58%,13rem)] items-center rounded-full bg-white/15 px-2.5 text-[11px] font-medium text-white shadow-sm ring-1 ring-white/25 backdrop-blur-md"
@@ -1709,7 +1739,7 @@ function ImageManagerContent({
                               } ${imageVisibilityActionClass(item.visibility)}`}
                             >
                               {visibilityMutatingPath === item.path ? (
-                                <LoaderCircle className="size-3 animate-spin" />
+                                <ApiLoadingMark size="inline" label="正在更新图片可见性" />
                               ) : item.visibility === "public" ? (
                                 <Lock className="size-3" />
                               ) : (
@@ -1844,7 +1874,7 @@ function ImageManagerContent({
                 onClick={() => void handleConfirmPublish()}
                 disabled={visibilityMutatingPath !== null}
               >
-                {visibilityMutatingPath ? <LoaderCircle className="size-4 animate-spin" /> : <Globe2 className="size-4" />}
+                {visibilityMutatingPath ? <ApiLoadingMark size="inline" label="正在公开图片" /> : <Globe2 className="size-4" />}
                 公开
               </Button>
             </DialogFooter>
@@ -1876,7 +1906,7 @@ function ImageManagerContent({
                 onClick={() => void handleConfirmDelete()}
                 disabled={isDeleting}
               >
-                {isDeleting ? <LoaderCircle className="size-4 animate-spin" /> : <Trash2 className="size-4" />}
+                {isDeleting ? <ApiLoadingMark size="inline" label="正在删除图片" /> : <Trash2 className="size-4" />}
                 确认删除
               </Button>
             </DialogFooter>
@@ -1890,15 +1920,17 @@ function ImageManagerContent({
 export default function ImageManagerPage() {
   const { isCheckingAuth, session } = useAuthGuard(undefined, "/image-manager");
   if (isCheckingAuth || !session) {
-    return <div className="flex min-h-[40vh] items-center justify-center"><LoaderCircle className="size-5 animate-spin text-stone-400" /></div>;
+    return <div className="flex min-h-[40vh] items-center justify-center"><ApiLoadingMark size="page" label="正在验证登录状态" /></div>;
   }
   const canDeleteImages = hasAPIPermission(session, "DELETE", "/api/images");
-  const canGenerateSimilar = canAccessPath(session, "/image") && hasAPIPermission(session, "POST", "/api/creation-tasks");
+  const canGenerateCreationSimilar = canAccessPath(session, "/image") && hasAPIPermission(session, "POST", "/api/creation-tasks");
+  const canGenerateExternalSimilar = canAccessPath(session, "/external-image") && hasAPIPermission(session, "POST", "/api/external-image-tasks");
   return (
     <ImageManagerContent
       cacheScope={imageManagerCacheScope(session)}
       canDeleteImages={canDeleteImages}
-      canGenerateSimilar={canGenerateSimilar}
+      canGenerateCreationSimilar={canGenerateCreationSimilar}
+      canGenerateExternalSimilar={canGenerateExternalSimilar}
       isAdmin={session.role === "admin"}
     />
   );

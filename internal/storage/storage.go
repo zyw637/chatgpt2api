@@ -2,6 +2,7 @@ package storage
 
 import (
 	"context"
+	"crypto/sha256"
 	"database/sql"
 	"encoding/json"
 	"errors"
@@ -14,7 +15,7 @@ import (
 	"strings"
 	"time"
 
-	_ "github.com/go-sql-driver/mysql"
+	mysql "github.com/go-sql-driver/mysql"
 	_ "github.com/lib/pq"
 	_ "modernc.org/sqlite"
 )
@@ -32,6 +33,12 @@ type JSONDocumentBackend interface {
 	LoadJSONDocument(name string) (any, error)
 	SaveJSONDocument(name string, value any) error
 	DeleteJSONDocument(name string) error
+}
+
+type ExternalImageTaskBackend interface {
+	LoadExternalImageTasks() (map[string]map[string]any, error)
+	UpsertExternalImageTask(taskKey string, task map[string]any) error
+	DeleteExternalImageTasks(taskKeys []string) error
 }
 
 type LogBackend interface {
@@ -65,6 +72,8 @@ type DatabaseBackend struct {
 	driver      string
 	dsn         string
 	db          *sql.DB
+	lockConn    *sql.Conn
+	lockName    string
 }
 
 func NewDatabaseBackend(databaseURL string) (*DatabaseBackend, error) {
@@ -76,7 +85,7 @@ func NewDatabaseBackend(databaseURL string) (*DatabaseBackend, error) {
 	if err != nil {
 		return nil, err
 	}
-	backend := &DatabaseBackend{databaseURL: databaseURL, driver: driver, dsn: dsn, db: db}
+	backend := &DatabaseBackend{databaseURL: databaseURL, driver: driver, dsn: dsn, db: db, lockName: databaseInstanceLockName(driver, dsn)}
 	backend.configurePool()
 	if err := backend.configureSQLite(); err != nil {
 		_ = db.Close()
@@ -86,16 +95,24 @@ func NewDatabaseBackend(databaseURL string) (*DatabaseBackend, error) {
 		_ = db.Close()
 		return nil, err
 	}
+	if err := backend.acquireInstanceLock(); err != nil {
+		_ = db.Close()
+		return nil, err
+	}
 	return backend, nil
 }
 
 func (b *DatabaseBackend) configurePool() {
-	b.db.SetConnMaxLifetime(time.Hour)
 	if b.driver == "sqlite" {
+		// SQLite locking_mode and several PRAGMAs are connection-local. Keep the
+		// only pooled connection for the backend lifetime so the instance lock
+		// cannot disappear during a connection rotation.
+		b.db.SetConnMaxLifetime(0)
 		b.db.SetMaxOpenConns(1)
 		b.db.SetMaxIdleConns(1)
 		return
 	}
+	b.db.SetConnMaxLifetime(time.Hour)
 	b.db.SetMaxOpenConns(10)
 	b.db.SetMaxIdleConns(5)
 }
@@ -104,7 +121,72 @@ func (b *DatabaseBackend) Close() error {
 	if b == nil || b.db == nil {
 		return nil
 	}
-	return b.db.Close()
+	var lockErr error
+	if b.lockConn != nil {
+		switch b.driver {
+		case "postgres":
+			_, lockErr = b.lockConn.ExecContext(context.Background(), `SELECT pg_advisory_unlock(6177294722339079284)`)
+		case "mysql":
+			_, lockErr = b.lockConn.ExecContext(context.Background(), `SELECT RELEASE_LOCK(?)`, b.lockName)
+		}
+		_ = b.lockConn.Close()
+		b.lockConn = nil
+	}
+	return errors.Join(lockErr, b.db.Close())
+}
+
+func (b *DatabaseBackend) acquireInstanceLock() error {
+	if b.driver == "sqlite" {
+		if _, err := b.db.Exec(`PRAGMA locking_mode=EXCLUSIVE`); err != nil {
+			return fmt.Errorf("enable sqlite single-instance lock: %w", err)
+		}
+		if _, err := b.db.Exec(`BEGIN EXCLUSIVE`); err != nil {
+			return fmt.Errorf("acquire sqlite single-instance lock: %w", err)
+		}
+		if _, err := b.db.Exec(`COMMIT`); err != nil {
+			return fmt.Errorf("commit sqlite single-instance lock: %w", err)
+		}
+		return nil
+	}
+	conn, err := b.db.Conn(context.Background())
+	if err != nil {
+		return err
+	}
+	locked := false
+	switch b.driver {
+	case "postgres":
+		err = conn.QueryRowContext(context.Background(), `SELECT pg_try_advisory_lock(6177294722339079284)`).Scan(&locked)
+	case "mysql":
+		var result sql.NullInt64
+		err = conn.QueryRowContext(context.Background(), `SELECT GET_LOCK(?, 0)`, b.lockName).Scan(&result)
+		locked = result.Valid && result.Int64 == 1
+	default:
+		err = fmt.Errorf("single-instance lock is not implemented for driver %s", b.driver)
+	}
+	if err != nil || !locked {
+		_ = conn.Close()
+		if err != nil {
+			return fmt.Errorf("acquire database single-instance lock: %w", err)
+		}
+		return errors.New("another chatgpt2api instance is already using this database")
+	}
+	b.lockConn = conn
+	return nil
+}
+
+func databaseInstanceLockName(driver, dsn string) string {
+	identity := dsn
+	if driver == "mysql" {
+		if config, err := mysql.ParseDSN(dsn); err == nil {
+			identity = strings.Join([]string{
+				strings.ToLower(strings.TrimSpace(config.Net)),
+				strings.ToLower(strings.TrimSpace(config.Addr)),
+				strings.TrimSpace(config.DBName),
+			}, "\x00")
+		}
+	}
+	sum := sha256.Sum256([]byte(driver + "\x00" + identity))
+	return fmt.Sprintf("chatgpt2api-%x", sum[:12])
 }
 
 func (b *DatabaseBackend) configureSQLite() error {
@@ -117,6 +199,7 @@ func (b *DatabaseBackend) configureSQLite() error {
 		`PRAGMA busy_timeout=5000`,
 		`PRAGMA temp_store=MEMORY`,
 		`PRAGMA foreign_keys=ON`,
+		`PRAGMA locking_mode=EXCLUSIVE`,
 	} {
 		if _, err := b.db.Exec(stmt); err != nil {
 			return err
@@ -130,6 +213,9 @@ func (b *DatabaseBackend) init() error {
 		`CREATE TABLE IF NOT EXISTS accounts (id INTEGER PRIMARY KEY AUTOINCREMENT, access_token TEXT UNIQUE NOT NULL, data TEXT NOT NULL)`,
 		`CREATE TABLE IF NOT EXISTS auth_keys (id INTEGER PRIMARY KEY AUTOINCREMENT, key_id TEXT UNIQUE NOT NULL, data TEXT NOT NULL)`,
 		`CREATE TABLE IF NOT EXISTS json_documents (name TEXT PRIMARY KEY, data TEXT NOT NULL, updated_at TEXT NOT NULL)`,
+		`CREATE TABLE IF NOT EXISTS external_image_tasks (task_key TEXT PRIMARY KEY, owner_id TEXT NOT NULL, updated_at TEXT NOT NULL, data TEXT NOT NULL)`,
+		`CREATE INDEX IF NOT EXISTS idx_external_image_tasks_owner_updated ON external_image_tasks (owner_id, updated_at)`,
+		`CREATE INDEX IF NOT EXISTS idx_external_image_tasks_updated ON external_image_tasks (updated_at)`,
 		`CREATE TABLE IF NOT EXISTS logs (id INTEGER PRIMARY KEY AUTOINCREMENT, created_at TEXT NOT NULL, type TEXT NOT NULL, day TEXT NOT NULL, data TEXT NOT NULL)`,
 		`CREATE INDEX IF NOT EXISTS idx_logs_day_id ON logs (day, id)`,
 	}
@@ -138,6 +224,9 @@ func (b *DatabaseBackend) init() error {
 			`CREATE TABLE IF NOT EXISTS accounts (id SERIAL PRIMARY KEY, access_token TEXT UNIQUE NOT NULL, data TEXT NOT NULL)`,
 			`CREATE TABLE IF NOT EXISTS auth_keys (id SERIAL PRIMARY KEY, key_id TEXT UNIQUE NOT NULL, data TEXT NOT NULL)`,
 			`CREATE TABLE IF NOT EXISTS json_documents (name TEXT PRIMARY KEY, data TEXT NOT NULL, updated_at TEXT NOT NULL)`,
+			`CREATE TABLE IF NOT EXISTS external_image_tasks (task_key TEXT PRIMARY KEY, owner_id TEXT NOT NULL, updated_at TEXT NOT NULL, data TEXT NOT NULL)`,
+			`CREATE INDEX IF NOT EXISTS idx_external_image_tasks_owner_updated ON external_image_tasks (owner_id, updated_at)`,
+			`CREATE INDEX IF NOT EXISTS idx_external_image_tasks_updated ON external_image_tasks (updated_at)`,
 			`CREATE TABLE IF NOT EXISTS logs (id SERIAL PRIMARY KEY, created_at TEXT NOT NULL, type TEXT NOT NULL, day TEXT NOT NULL, data TEXT NOT NULL)`,
 			`CREATE INDEX IF NOT EXISTS idx_logs_day_id ON logs (day, id)`,
 		}
@@ -147,6 +236,7 @@ func (b *DatabaseBackend) init() error {
 			`CREATE TABLE IF NOT EXISTS accounts (id INTEGER PRIMARY KEY AUTO_INCREMENT, access_token TEXT UNIQUE NOT NULL, data TEXT NOT NULL)`,
 			`CREATE TABLE IF NOT EXISTS auth_keys (id INTEGER PRIMARY KEY AUTO_INCREMENT, key_id TEXT UNIQUE NOT NULL, data TEXT NOT NULL)`,
 			`CREATE TABLE IF NOT EXISTS json_documents (name VARCHAR(512) PRIMARY KEY, data LONGTEXT NOT NULL, updated_at TEXT NOT NULL)`,
+			`CREATE TABLE IF NOT EXISTS external_image_tasks (task_key VARCHAR(512) CHARACTER SET utf8mb4 COLLATE utf8mb4_bin PRIMARY KEY, owner_id VARCHAR(255) NOT NULL, updated_at VARCHAR(30) NOT NULL, data LONGTEXT NOT NULL, INDEX idx_external_image_tasks_owner_updated (owner_id, updated_at), INDEX idx_external_image_tasks_updated (updated_at))`,
 			`CREATE TABLE IF NOT EXISTS logs (id INTEGER PRIMARY KEY AUTO_INCREMENT, created_at TEXT NOT NULL, type VARCHAR(64) NOT NULL, day VARCHAR(10) NOT NULL, data LONGTEXT NOT NULL)`,
 			`CREATE INDEX idx_logs_day_id ON logs (day, id)`,
 		}
@@ -211,12 +301,16 @@ func (b *DatabaseBackend) loadRows(table string) ([]map[string]any, error) {
 	for rows.Next() {
 		var text string
 		if err := rows.Scan(&text); err != nil {
-			continue
+			return nil, fmt.Errorf("scan %s row: %w", table, err)
 		}
 		var item map[string]any
-		if json.Unmarshal([]byte(text), &item) == nil && item != nil {
-			out = append(out, item)
+		if err := json.Unmarshal([]byte(text), &item); err != nil {
+			return nil, fmt.Errorf("decode %s row: %w", table, err)
 		}
+		if item == nil {
+			return nil, fmt.Errorf("decode %s row: object is null", table)
+		}
+		out = append(out, item)
 	}
 	return out, rows.Err()
 }
@@ -252,7 +346,7 @@ func (b *DatabaseBackend) saveRows(table, keyColumn string, items []map[string]a
 		}
 		data, err := json.Marshal(item)
 		if err != nil {
-			continue
+			return fmt.Errorf("encode %s row: %w", table, err)
 		}
 		if _, err := stmt.Exec(key, string(data)); err != nil {
 			return err
@@ -312,6 +406,102 @@ func (b *DatabaseBackend) DeleteJSONDocument(name string) error {
 		return err
 	}
 	_, err = b.db.Exec("DELETE FROM json_documents WHERE name = "+b.placeholder(1), rel)
+	return err
+}
+
+func (b *DatabaseBackend) LoadExternalImageTasks() (map[string]map[string]any, error) {
+	rows, err := b.db.Query("SELECT task_key, data FROM external_image_tasks")
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	items := make(map[string]map[string]any)
+	for rows.Next() {
+		var taskKey string
+		var text string
+		if err := rows.Scan(&taskKey, &text); err != nil {
+			return nil, fmt.Errorf("scan external image task: %w", err)
+		}
+		taskKey = strings.TrimSpace(taskKey)
+		if taskKey == "" {
+			return nil, errors.New("decode external image task: task key is empty")
+		}
+		value, err := decodeJSONString(text)
+		if err != nil {
+			return nil, fmt.Errorf("decode external image task: %w", err)
+		}
+		item, ok := value.(map[string]any)
+		if !ok {
+			return nil, errors.New("decode external image task: value is not an object")
+		}
+		items[taskKey] = item
+	}
+	return items, rows.Err()
+}
+
+func (b *DatabaseBackend) UpsertExternalImageTask(taskKey string, task map[string]any) error {
+	taskKey = strings.TrimSpace(taskKey)
+	if taskKey == "" {
+		return errors.New("external image task key is required")
+	}
+	if task == nil {
+		return errors.New("external image task is required")
+	}
+	ownerID, _ := task["owner_id"].(string)
+	ownerID = strings.TrimSpace(ownerID)
+	if ownerID == "" {
+		return errors.New("external image task owner_id is required")
+	}
+	updatedAt, _ := task["updated_at"].(string)
+	updatedAt = strings.TrimSpace(updatedAt)
+	if updatedAt == "" {
+		return errors.New("external image task updated_at is required")
+	}
+	updatedTime, err := time.Parse(time.RFC3339Nano, updatedAt)
+	if err != nil {
+		return fmt.Errorf("external image task updated_at is invalid: %w", err)
+	}
+	updatedAt = updatedTime.UTC().Format("2006-01-02T15:04:05.000000000Z")
+	data, err := json.Marshal(task)
+	if err != nil {
+		return fmt.Errorf("encode external image task: %w", err)
+	}
+	var stmt string
+	switch b.driver {
+	case "postgres":
+		stmt = "INSERT INTO external_image_tasks (task_key, owner_id, updated_at, data) VALUES ($1, $2, $3, $4) ON CONFLICT (task_key) DO UPDATE SET owner_id = EXCLUDED.owner_id, updated_at = EXCLUDED.updated_at, data = EXCLUDED.data"
+	case "mysql":
+		stmt = "INSERT INTO external_image_tasks (task_key, owner_id, updated_at, data) VALUES (?, ?, ?, ?) ON DUPLICATE KEY UPDATE owner_id = VALUES(owner_id), updated_at = VALUES(updated_at), data = VALUES(data)"
+	default:
+		stmt = "INSERT INTO external_image_tasks (task_key, owner_id, updated_at, data) VALUES (?, ?, ?, ?) ON CONFLICT(task_key) DO UPDATE SET owner_id = excluded.owner_id, updated_at = excluded.updated_at, data = excluded.data"
+	}
+	_, err = b.db.Exec(stmt, taskKey, ownerID, updatedAt, string(data))
+	return err
+}
+
+func (b *DatabaseBackend) DeleteExternalImageTasks(taskKeys []string) error {
+	if len(taskKeys) == 0 {
+		return nil
+	}
+	args := make([]any, 0, len(taskKeys))
+	placeholders := make([]string, 0, len(taskKeys))
+	seen := make(map[string]struct{}, len(taskKeys))
+	for _, taskKey := range taskKeys {
+		taskKey = strings.TrimSpace(taskKey)
+		if taskKey == "" {
+			return errors.New("external image task key is required")
+		}
+		if _, ok := seen[taskKey]; ok {
+			continue
+		}
+		seen[taskKey] = struct{}{}
+		args = append(args, taskKey)
+		placeholders = append(placeholders, b.placeholder(len(args)))
+	}
+	if len(args) == 0 {
+		return nil
+	}
+	_, err := b.db.Exec("DELETE FROM external_image_tasks WHERE task_key IN ("+strings.Join(placeholders, ", ")+")", args...)
 	return err
 }
 

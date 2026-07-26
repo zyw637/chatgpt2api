@@ -49,7 +49,7 @@
 - Go 单体服务，容器内启动 `/app/chatgpt2api`。
 - 前端构建产物嵌入 Go 二进制，由 Go 服务直接托管。
 - 支持 Docker / Docker Compose 部署。
-- 支持 SQLite、JSON 文件和 PostgreSQL 存储后端。
+- 支持 SQLite、PostgreSQL 和 MySQL 存储后端。
 - 支持全局 HTTP / HTTPS / SOCKS5 / SOCKS5H 代理。
 - 支持 DockerHub 默认版本检查，以及非 Docker Release 构建的在线更新和回滚。
 
@@ -317,6 +317,8 @@ go build -tags=embed -ldflags "-X chatgpt2api/internal/version.Version=1.0.0" -o
 | --- | --- | --- |
 | `STORAGE_BACKEND` | `sqlite` | 存储后端，可选 `sqlite`、`postgres`、`mysql` |
 | `DATABASE_URL` | 自动 | SQLite、PostgreSQL 或 MySQL 连接串 |
+| `CORS_ALLOWED_ORIGINS` | 空 | 允许携带 Cookie 的完整 origin，多个值用逗号分隔 |
+| `TRUSTED_PROXY_CIDRS` | 空 | 可信反向代理 CIDR，多个值用逗号分隔；loopback 始终可信 |
 
 SQLite 示例：
 
@@ -339,7 +341,7 @@ STORAGE_BACKEND=mysql
 DATABASE_URL=mysql://user:password@host:3306/chatgpt2api
 ```
 
-新部署默认使用 SQLite，并自动创建 `data/chatgpt2api.db`。本地 JSON 文件存储后端已移除，`STORAGE_BACKEND=json` 不再支持。
+新部署默认使用 SQLite，并自动创建 `data/chatgpt2api.db`。当前快照式服务只允许一个进程使用同一数据库；SQLite 通过 exclusive lock，PostgreSQL/MySQL 通过 advisory lock 拒绝第二个实例。需要横向扩展时，应先完成按资源增量更新和版本控制迁移。本地 JSON 文件存储后端已移除，`STORAGE_BACKEND=json` 不再支持。
 
 ### Linuxdo 登录
 
@@ -634,10 +636,6 @@ curl http://localhost:3000/v1/responses \
     <td width="50%">
       <strong>日志管理</strong><br />
       <img src="assets/log.png" alt="日志管理" />
-    </td>
-    <td width="50%">
-      <strong>注册管理</strong><br />
-      <img src="assets/zhuceji.png" alt="注册管理" />
     </td>
   </tr>
 </table>

@@ -24,6 +24,7 @@ import {
 import { toast } from "sonner";
 
 import { PageHeader } from "@/components/page-header";
+import { ApiLoadingMark } from "@/components/api-loading-mark";
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
 import { Card, CardContent } from "@/components/ui/card";
@@ -633,7 +634,7 @@ function AccountsPageContent({ session }: { session: StoredAuthSession }) {
     return (
       <>
         <Badge variant={status.badge} className="inline-flex items-center gap-1 rounded-md px-2 py-1">
-          <StatusIcon className="size-3.5" />
+          <StatusIcon className={cn("size-3.5", account.status === "刷新中" && "animate-spin")} />
           {account.status}
         </Badge>
         {account.enabled === false ? (
@@ -702,7 +703,7 @@ function AccountsPageContent({ session }: { session: StoredAuthSession }) {
             title={nextEnabled ? "启用账号" : "禁用账号"}
           >
             {rowTogglingEnabled ? (
-              <LoaderCircle className="size-4 animate-spin" />
+              <ApiLoadingMark size="inline" label="正在更新账号状态" />
             ) : nextEnabled ? (
               <Power className="size-4" />
             ) : (
@@ -735,7 +736,7 @@ function AccountsPageContent({ session }: { session: StoredAuthSession }) {
             aria-label="刷新账号信息和额度"
             title="刷新账号信息和额度"
           >
-            {rowRefreshing ? <LoaderCircle className="size-4 animate-spin" /> : <RefreshCw className="size-4" />}
+            <RefreshCw className={cn("size-4", rowRefreshing && "animate-spin")} />
           </Button>
         ) : null}
         {canDeleteAccounts ? (
@@ -915,7 +916,7 @@ function AccountsPageContent({ session }: { session: StoredAuthSession }) {
                     }
                     disabled={isUpdating || isRunningUpstreamActions || isTogglingEnabled}
                   >
-                    {isRunningUpstreamActions ? <LoaderCircle className="size-4 animate-spin" /> : <ServerCog className="size-4" />}
+                    {isRunningUpstreamActions ? <ApiLoadingMark size="inline" label="正在关闭记忆" /> : <ServerCog className="size-4" />}
                     关闭记忆
                   </Button>
                   <Button
@@ -932,7 +933,7 @@ function AccountsPageContent({ session }: { session: StoredAuthSession }) {
                     }
                     disabled={isUpdating || isRunningUpstreamActions || isTogglingEnabled}
                   >
-                    {isRunningUpstreamActions ? <LoaderCircle className="size-4 animate-spin" /> : <ServerCog className="size-4" />}
+                    {isRunningUpstreamActions ? <ApiLoadingMark size="inline" label="正在隐藏历史对话" /> : <ServerCog className="size-4" />}
                     隐藏历史对话
                   </Button>
                   <Button
@@ -949,7 +950,7 @@ function AccountsPageContent({ session }: { session: StoredAuthSession }) {
                     }
                     disabled={isUpdating || isRunningUpstreamActions || isTogglingEnabled}
                   >
-                    {isRunningUpstreamActions ? <LoaderCircle className="size-4 animate-spin" /> : <Trash2 className="size-4" />}
+                    {isRunningUpstreamActions ? <ApiLoadingMark size="inline" label="正在删除附件" /> : <Trash2 className="size-4" />}
                     删除附件
                   </Button>
                 </div>
@@ -982,7 +983,7 @@ function AccountsPageContent({ session }: { session: StoredAuthSession }) {
               onClick={() => void handleUpdateAccount()}
               disabled={isUpdating || isRunningUpstreamActions || !canUpdateAccount}
             >
-              {isUpdating ? <LoaderCircle className="size-4 animate-spin" /> : null}
+              {isUpdating ? <ApiLoadingMark size="inline" label="正在保存账号" /> : null}
               保存修改
             </Button>
           </DialogFooter>
@@ -1075,7 +1076,7 @@ function AccountsPageContent({ session }: { session: StoredAuthSession }) {
                 (!upstreamActionDisableMemory && !upstreamActionHideConversations && !upstreamActionDeleteFiles)
               }
             >
-              {isRunningUpstreamActions ? <LoaderCircle className="size-4 animate-spin" /> : <ServerCog className="size-4" />}
+              {isRunningUpstreamActions ? <ApiLoadingMark size="inline" label="正在执行上游维护" /> : <ServerCog className="size-4" />}
               开始执行
             </Button>
           </DialogFooter>
@@ -1174,7 +1175,7 @@ function AccountsPageContent({ session }: { session: StoredAuthSession }) {
           <Card>
             <CardContent className="flex flex-col items-center justify-center gap-3 px-6 py-14 text-center">
               <div className="rounded-xl bg-stone-100 p-3 text-stone-500">
-                <LoaderCircle className="size-5 animate-spin" />
+                <ApiLoadingMark size="section" label="正在加载账户" />
               </div>
               <div className="space-y-1">
                 <p className="text-sm font-medium text-stone-700">正在加载账户</p>
@@ -1208,7 +1209,7 @@ function AccountsPageContent({ session }: { session: StoredAuthSession }) {
                     onClick={() => void handleRefreshAccounts(selectedAccountIds)}
                     disabled={selectedAccountIds.length === 0 || isRefreshing || isDeleting || isRunningUpstreamActions || isTogglingEnabled}
                   >
-                    {isRefreshing ? <LoaderCircle className="size-4 animate-spin" /> : <RefreshCw className="size-4" />}
+                    <RefreshCw className={cn("size-4", isRefreshing && "animate-spin")} />
                     刷新选中
                   </Button>
                 ) : null}
@@ -1220,7 +1221,7 @@ function AccountsPageContent({ session }: { session: StoredAuthSession }) {
                         className="h-8 rounded-lg px-3 text-stone-600 hover:bg-stone-100"
                         disabled={selectedAccountIds.length === 0 || isRefreshing || isDeleting || isRunningUpstreamActions || isTogglingEnabled}
                       >
-                        {isTogglingEnabled ? <LoaderCircle className="size-4 animate-spin" /> : <Power className="size-4" />}
+                        {isTogglingEnabled ? <ApiLoadingMark size="inline" label="正在批量更新账号状态" /> : <Power className="size-4" />}
                         批量启停
                       </Button>
                     </PopoverTrigger>
@@ -1253,7 +1254,7 @@ function AccountsPageContent({ session }: { session: StoredAuthSession }) {
                     onClick={() => openUpstreamActionDialog(selectedAccountIds)}
                     disabled={selectedAccountIds.length === 0 || isRefreshing || isDeleting || isRunningUpstreamActions || isTogglingEnabled}
                   >
-                    {isRunningUpstreamActions ? <LoaderCircle className="size-4 animate-spin" /> : <ServerCog className="size-4" />}
+                    {isRunningUpstreamActions ? <ApiLoadingMark size="inline" label="正在执行上游维护" /> : <ServerCog className="size-4" />}
                     上游维护
                   </Button>
                 ) : null}
@@ -1265,7 +1266,7 @@ function AccountsPageContent({ session }: { session: StoredAuthSession }) {
                       onClick={() => void handleDeleteAccounts(abnormalAccountIds)}
                       disabled={abnormalAccountIds.length === 0 || isRefreshing || isDeleting || isRunningUpstreamActions || isTogglingEnabled}
                     >
-                      {isDeleting ? <LoaderCircle className="size-4 animate-spin" /> : <Trash2 className="size-4" />}
+                      {isDeleting ? <ApiLoadingMark size="inline" label="正在移除异常账号" /> : <Trash2 className="size-4" />}
                       移除异常账号
                     </Button>
                     <Button
@@ -1274,7 +1275,7 @@ function AccountsPageContent({ session }: { session: StoredAuthSession }) {
                       onClick={() => void handleDeleteAccounts(selectedAccountIds)}
                       disabled={selectedAccountIds.length === 0 || isRefreshing || isDeleting || isRunningUpstreamActions || isTogglingEnabled}
                     >
-                      {isDeleting ? <LoaderCircle className="size-4 animate-spin" /> : <Trash2 className="size-4" />}
+                      {isDeleting ? <ApiLoadingMark size="inline" label="正在删除账号" /> : <Trash2 className="size-4" />}
                       删除所选
                     </Button>
                   </>
@@ -1514,7 +1515,7 @@ export default function AccountsPage() {
   if (isCheckingAuth || !session) {
     return (
       <div className="flex min-h-[40vh] items-center justify-center">
-        <LoaderCircle className="size-5 animate-spin text-stone-400" />
+        <ApiLoadingMark size="page" label="正在验证登录状态" />
       </div>
     );
   }

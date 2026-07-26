@@ -2,6 +2,66 @@ package service
 
 import "testing"
 
+func TestDefaultUserCanSyncExternalChatHistory(t *testing.T) {
+	permissions := DefaultPermissionSetForRole(AuthRoleUser)
+	for _, test := range []struct {
+		method string
+		path   string
+	}{
+		{method: "GET", path: "/api/external-chat-conversations"},
+		{method: "PUT", path: "/api/external-chat-conversations"},
+	} {
+		if !HasAPIPermission(permissions, test.method, test.path) {
+			t.Fatalf("default user missing %s %s", test.method, test.path)
+		}
+	}
+}
+
+func TestImageConversationHistoryIsNotRoleGated(t *testing.T) {
+	// Catalog no longer exposes image conversation history; access is granted to every
+	// authenticated identity via isPermissionCheckSkipped in the HTTP layer.
+	for _, key := range []string{
+		APIPermissionKey("GET", "/api/image-conversations"),
+		APIPermissionKey("PUT", "/api/image-conversations"),
+	} {
+		for _, permission := range AllAPIPermissions() {
+			if permission.Key == key {
+				t.Fatalf("image conversation history should not be in RBAC catalog: %s", key)
+			}
+		}
+	}
+	if HasAPIPermission(DefaultPermissionSetForRole(AuthRoleUser), "GET", "/api/image-conversations") {
+		t.Fatal("default user role set should not claim image conversation API keys")
+	}
+}
+
+func TestMergeDefaultManagedRoleAddsHistoryPermissionsOnlyToBuiltinRole(t *testing.T) {
+	oldPermissions := []string{
+		APIPermissionKey("GET", "/api/external-chat-providers"),
+		APIPermissionKey("POST", "/api/external-chat/completions"),
+	}
+	roles := mergeDefaultManagedRole([]ManagedRole{
+		{ID: DefaultManagedRoleID, Name: "普通用户", MenuPaths: []string{"/external-chat"}, APIPermissions: oldPermissions},
+		{ID: "custom-chat", Name: "自定义聊天", MenuPaths: []string{"/external-chat"}, APIPermissions: oldPermissions},
+	})
+
+	for _, role := range roles {
+		permissions := role.PermissionSet()
+		hasChatRead := HasAPIPermission(permissions, "GET", "/api/external-chat-conversations")
+		hasChatWrite := HasAPIPermission(permissions, "PUT", "/api/external-chat-conversations")
+		switch role.ID {
+		case DefaultManagedRoleID:
+			if !hasChatRead || !hasChatWrite {
+				t.Fatalf("builtin role missing history permissions: %#v", role.APIPermissions)
+			}
+		case "custom-chat":
+			if hasChatRead || hasChatWrite {
+				t.Fatalf("custom role was implicitly expanded: %#v", role.APIPermissions)
+			}
+		}
+	}
+}
+
 func TestNormalizeAPIPermissionsMigratesCreationTaskPermissions(t *testing.T) {
 	permissions := NormalizeAPIPermissions([]string{
 		APIPermissionKey("GET", "/api/image-tasks"),

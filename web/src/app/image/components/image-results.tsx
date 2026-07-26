@@ -1,9 +1,10 @@
 "use client";
 
 import { useRef, useState } from "react";
-import { Check, CircleStop, Clock3, Download, Eye, Globe2, LoaderCircle, Lock, PencilLine, Plus, RotateCcw, Sparkles } from "lucide-react";
+import { Check, CircleStop, Clock3, Download, Eye, Globe2, LoaderCircle, Lock, PencilLine, Plus, RotateCcw } from "lucide-react";
 
 import { AuthenticatedImage } from "@/components/authenticated-image";
+import { ApiLoadingMark } from "@/components/api-loading-mark";
 import { Button } from "@/components/ui/button";
 import type { ImagePromptPreset } from "@/app/image/image-presets";
 import { formatImageSizeDisplay, getImageSizeRequirementLabel, isHighResolutionImageSize } from "@/app/image/image-options";
@@ -19,6 +20,7 @@ import { cn } from "@/lib/utils";
 import {
   getImageTurnLoadingPhase,
   getStoredImageLoadingPhase,
+  resolveReferenceImageSrc,
   type ImageConversation,
   type ImageTurn,
   type ImageTurnStatus,
@@ -26,6 +28,7 @@ import {
   type StoredReferenceImage,
 } from "@/store/image-conversations";
 import { imageTurnStartedAtTimestamp, type ImageTurnProgress } from "@/store/image-turn-progress";
+import { ConversationEmptyState } from "@/app/image/components/conversation-empty-state";
 
 export type ImageLightboxItem = {
   id: string;
@@ -49,6 +52,8 @@ type ImageResultsProps = {
   progressByTurnKey: Record<string, ImageTurnProgress>;
   progressNow: number;
   promptPresets: readonly ImagePromptPreset[];
+  emptyStateMode: "chat" | "image";
+  emptyStateModel?: string;
   onOpenLightbox: (images: ImageLightboxItem[], index: number) => void;
   onApplyPromptPreset: (preset: ImagePromptPreset) => void | Promise<void>;
   onContinueEdit: (conversationId: string, image: StoredImage | StoredReferenceImage) => void;
@@ -260,6 +265,8 @@ export function ImageResults({
   progressByTurnKey,
   progressNow,
   promptPresets,
+  emptyStateMode,
+  emptyStateModel,
   onOpenLightbox,
   onApplyPromptPreset,
   onContinueEdit,
@@ -338,57 +345,7 @@ export function ImageResults({
   };
 
   if (!selectedConversation) {
-    return (
-      <div className="flex h-full min-h-[300px] items-center justify-center px-0 py-3 text-center sm:min-h-[420px] sm:py-6">
-        <div className="mx-auto flex w-full max-w-[1180px] flex-col gap-5">
-          <div className="mx-auto flex max-w-[640px] flex-col items-center">
-            <div className="mb-3 inline-flex items-center gap-2 rounded-full bg-[#f0f0f0] px-3 py-1 text-xs font-medium text-[#45515e]">
-              <Sparkles className="size-4 text-[#1456f0]" />
-              生图预设
-            </div>
-            <h1 className="font-display text-3xl leading-[1.08] font-medium text-[#222222] sm:text-5xl">
-              Turn ideas into images
-            </h1>
-            <p className="mx-auto mt-3 max-w-[460px] text-sm leading-6 text-[#45515e] sm:text-[15px]">
-              选择一组真实案例预设快速开始，也可以直接在下方输入自己的画面描述。
-            </p>
-          </div>
-          <div className="hide-scrollbar flex gap-3 overflow-x-auto px-1 pb-1 text-left sm:grid sm:grid-cols-2 sm:overflow-visible lg:grid-cols-4">
-            {promptPresets.map((preset) => (
-              <button
-                key={preset.id}
-                type="button"
-                className="group w-[250px] shrink-0 overflow-hidden rounded-[22px] border border-[#f2f3f5] bg-white transition hover:-translate-y-0.5 hover:shadow-[0_12px_16px_-4px_rgba(36,36,36,0.08)] sm:w-auto"
-                onClick={() => void onApplyPromptPreset(preset)}
-                aria-label={`套用预设：${preset.title}`}
-              >
-                <div className="relative aspect-[16/9] overflow-hidden bg-[#f0f0f0]">
-                  <img
-                    src={preset.imageSrc}
-                    alt={preset.title}
-                    loading="lazy"
-                    className="h-full w-full object-cover transition duration-300 group-hover:scale-[1.03]"
-                  />
-                  <div className="absolute inset-x-0 bottom-0 flex items-center justify-between gap-2 bg-gradient-to-t from-black/70 via-black/25 to-transparent px-3 pt-8 pb-2">
-                    <span className="rounded-full bg-white/92 px-2 py-0.5 text-[11px] font-medium text-[#18181b] shadow-sm">
-                      {preset.size || "Auto"}
-                    </span>
-                    <span className="rounded-full bg-white/18 px-2 py-0.5 text-[11px] font-medium text-white shadow-sm backdrop-blur">
-                      {preset.count} 张
-                    </span>
-                  </div>
-                </div>
-                <div className="flex flex-col gap-2 px-4 py-3.5">
-                  <div className="font-display text-sm font-semibold text-[#222222]">{preset.title}</div>
-                  <div className="line-clamp-2 text-sm leading-6 text-[#45515e]">{preset.hint}</div>
-                  <div className="border-t border-[#f2f3f5] pt-2 text-xs font-medium text-[#1456f0]">套用这个预设</div>
-                </div>
-              </button>
-            ))}
-          </div>
-        </div>
-      </div>
-    );
+    return <ConversationEmptyState mode={emptyStateMode} model={emptyStateModel} promptPresets={promptPresets} onApplyPromptPreset={onApplyPromptPreset} />;
   }
 
   return (
@@ -397,7 +354,7 @@ export function ImageResults({
         const progress = progressByTurnKey[turnProgressKey(selectedConversation.id, turn.id)];
         const referenceLightboxImages = turn.referenceImages.map((image, index) => ({
           id: `${turn.id}-reference-${index}`,
-          src: image.dataUrl,
+          src: resolveReferenceImageSrc(image),
           fileName: image.name,
         }));
         const downloadableImages = turn.images.flatMap((image, index) => {
@@ -582,8 +539,8 @@ export function ImageResults({
                           className="group relative size-20 shrink-0 overflow-hidden rounded-2xl border border-stone-200/80 bg-stone-100/60 text-left transition hover:border-stone-300 sm:size-24"
                           aria-label={`预览参考图 ${image.name || index + 1}`}
                         >
-                          <img
-                            src={image.dataUrl}
+                          <AuthenticatedImage
+                            src={resolveReferenceImageSrc(image)}
                             alt={image.name || `参考图 ${index + 1}`}
                             className="absolute inset-0 h-full w-full object-cover transition duration-200 group-hover:scale-[1.02]"
                           />
@@ -799,7 +756,7 @@ export function ImageResults({
                                 title={visibility === "public" ? "取消公开" : "公开"}
                               >
                                 {isVisibilityMutating ? (
-                                  <LoaderCircle className="size-3 animate-spin" />
+                                  <ApiLoadingMark size="inline" label="正在更新图片可见性" />
                                 ) : visibility === "public" ? (
                                   <Lock className="size-3" />
                                 ) : (
@@ -886,7 +843,7 @@ export function ImageResults({
                             {imageLoadingPhase === "queued" ? (
                               <Clock3 className="size-5" />
                             ) : (
-                              <LoaderCircle className="size-5 animate-spin" />
+                              <ApiLoadingMark size="media" label="正在处理图片" />
                             )}
                           </div>
                           <p className="text-sm">

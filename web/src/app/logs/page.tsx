@@ -1,13 +1,14 @@
 "use client";
 
 import { useCallback, useEffect, useState, type FormEvent } from "react";
-import { ChevronLeft, ChevronRight, Copy, LoaderCircle, RefreshCw, Search, X } from "lucide-react";
+import { ChevronLeft, ChevronRight, Copy, RefreshCw, Search, X } from "lucide-react";
 import { toast } from "sonner";
 
 import { AuthenticatedImage } from "@/components/authenticated-image";
 import { DateRangeFilter } from "@/components/date-range-filter";
 import { ImageLightbox } from "@/components/image-lightbox";
 import { PageHeader } from "@/components/page-header";
+import { ApiLoadingMark } from "@/components/api-loading-mark";
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
 import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
@@ -435,7 +436,7 @@ function LogsContent() {
             </div>
             <div className="flex gap-2 md:col-span-2 xl:col-span-2">
               <Button type="submit" disabled={isLoading} className="h-10 rounded-lg">
-                {isLoading ? <LoaderCircle className="size-4 animate-spin" /> : <Search className="size-4" />}
+                {isLoading ? <ApiLoadingMark size="inline" label="正在查询日志" /> : <Search className="size-4" />}
                 查询
               </Button>
               <Button type="button" variant="outline" onClick={clearFilters} className="h-10 rounded-lg">
@@ -640,7 +641,7 @@ function LogsContent() {
 export default function LogsPage() {
   const { isCheckingAuth, session } = useAuthGuard(undefined, "/logs");
   if (isCheckingAuth || !session) {
-    return <div className="flex min-h-[40vh] items-center justify-center"><LoaderCircle className="size-5 animate-spin text-stone-400" /></div>;
+    return <div className="flex min-h-[40vh] items-center justify-center"><ApiLoadingMark size="page" label="正在验证登录状态" /></div>;
   }
   return <LogsContent />;
 }

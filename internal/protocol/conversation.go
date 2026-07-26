@@ -298,7 +298,6 @@ func imageStreamErrorMessage(message string) string {
 	}
 	return text
 }
-
 func isCodexResponsesUnauthorizedErrorMessage(message string) bool {
 	return strings.Contains(message, "/backend-api/codex/responses failed: status=401") &&
 		strings.Contains(message, "unauthorized")
@@ -600,7 +599,11 @@ func (e *Engine) runSingleImageOutput(ctx context.Context, out chan<- ImageOutpu
 				requestForToken.UpstreamParentMessageID = session.UpstreamParentMessageID
 			} else {
 				if hasSession {
-					e.invalidateImageConversationSession(request)
+					if err := e.invalidateImageConversationSession(request); err != nil {
+						result.lastError = err.Error()
+						result.err = NewImageGenerationError(err.Error())
+						return false
+					}
 					hasSession = false
 					preferredToken = ""
 				}
@@ -683,7 +686,11 @@ func (e *Engine) runSingleImageOutput(ctx context.Context, out chan<- ImageOutpu
 						e.Accounts.ApplyAccountErrorMessage(token, "image_stream", rateLimitMessage)
 					}
 					if useSession {
-						e.invalidateImageConversationSession(request)
+						if sessionErr := e.invalidateImageConversationSession(request); sessionErr != nil {
+							result.lastError = sessionErr.Error()
+							result.err = NewImageGenerationError(sessionErr.Error())
+							return false
+						}
 						hasSession = false
 						preferredToken = ""
 					}
@@ -694,7 +701,11 @@ func (e *Engine) runSingleImageOutput(ctx context.Context, out chan<- ImageOutpu
 						e.Accounts.MarkImageResult(token, false)
 					}
 					if useSession {
-						e.invalidateImageConversationSession(request)
+						if sessionErr := e.invalidateImageConversationSession(request); sessionErr != nil {
+							result.lastError = sessionErr.Error()
+							result.err = NewImageGenerationError(sessionErr.Error())
+							return false
+						}
 						hasSession = false
 						preferredToken = ""
 						return true
@@ -705,7 +716,10 @@ func (e *Engine) runSingleImageOutput(ctx context.Context, out chan<- ImageOutpu
 				if e.Accounts != nil {
 					e.Accounts.MarkImageResult(token, true)
 				}
-				e.bindImageConversationSession(request, token, lastConversationID, lastMessageID)
+				if sessionErr := e.bindImageConversationSession(request, token, lastConversationID, lastMessageID); sessionErr != nil {
+					result.lastError = sessionErr.Error()
+					result.err = NewImageGenerationError(sessionErr.Error())
+				}
 				return false
 			}
 			var billingErr service.BillingLimitError
@@ -722,7 +736,11 @@ func (e *Engine) runSingleImageOutput(ctx context.Context, out chan<- ImageOutpu
 			}
 			result.lastError = err.Error()
 			if useSession {
-				e.invalidateImageConversationSession(request)
+				if sessionErr := e.invalidateImageConversationSession(request); sessionErr != nil {
+					result.err = NewImageGenerationError(sessionErr.Error())
+					result.lastError = sessionErr.Error()
+					return false
+				}
 				hasSession = false
 				preferredToken = ""
 				return true
@@ -806,23 +824,23 @@ func (e *Engine) activeImageConversationSession(request ConversationRequest) (se
 	return session, true
 }
 
-func (e *Engine) invalidateImageConversationSession(request ConversationRequest) {
+func (e *Engine) invalidateImageConversationSession(request ConversationRequest) error {
 	if e == nil || e.ImageConversationSessions == nil || request.OwnerID == "" || request.FrontendConversationID == "" {
-		return
+		return nil
 	}
-	e.ImageConversationSessions.Invalidate(request.OwnerID, request.FrontendConversationID)
+	return e.ImageConversationSessions.Invalidate(request.OwnerID, request.FrontendConversationID)
 }
 
-func (e *Engine) bindImageConversationSession(request ConversationRequest, token, conversationID, parentMessageID string) {
+func (e *Engine) bindImageConversationSession(request ConversationRequest, token, conversationID, parentMessageID string) error {
 	if e == nil || e.ImageConversationSessions == nil || request.OwnerID == "" || request.FrontendConversationID == "" {
-		return
+		return nil
 	}
 	conversationID = strings.TrimSpace(conversationID)
 	parentMessageID = strings.TrimSpace(parentMessageID)
 	if token == "" || conversationID == "" || parentMessageID == "" {
-		return
+		return nil
 	}
-	e.ImageConversationSessions.Bind(service.ImageConversationSession{
+	return e.ImageConversationSessions.Bind(service.ImageConversationSession{
 		OwnerID:                 request.OwnerID,
 		FrontendConversationID:  request.FrontendConversationID,
 		AccessToken:             token,

@@ -14,6 +14,12 @@ if (!rootElement) {
 
 applyColorTheme(getPreferredColorTheme());
 
+if (import.meta.env.PROD && "serviceWorker" in navigator) {
+  window.addEventListener("load", () => {
+    void navigator.serviceWorker.register("/sw.js?v=20260720-1", { updateViaCache: "none" });
+  });
+}
+
 createRoot(rootElement).render(
   <StrictMode>
     <BrowserRouter>
