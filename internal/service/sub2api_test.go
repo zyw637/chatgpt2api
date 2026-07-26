@@ -181,3 +181,30 @@ func TestSub2APIFetchAccessTokenFallsBackToLegacyDetailWhenDataExportMissing(t *
 		t.Fatalf("paths = %#v, want %#v", paths, wantPaths)
 	}
 }
+
+func TestSub2APIImportMarksJobFailedWhenAccountsCannotPersist(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/api/v1/admin/accounts/data" {
+			http.NotFound(w, r)
+			return
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"code":0,"data":{"accounts":[{"credentials":{"access_token":"imported-token"}}]}}`))
+	}))
+	defer server.Close()
+
+	backend := newFailingStorageBackend(t)
+	proxy := NewProxyService(testAccountConfig{})
+	accounts := NewAccountService(backend, testAccountConfig{}, proxy, NewLogService(backend))
+	config := NewSub2APIConfig(backend)
+	remote, _ := config.AddServer("test", server.URL, "", "", "api-key", "")
+	config.SetImportJob(remote["id"].(string), newImportJob(1))
+	backend.failAccounts = true
+
+	service := NewSub2APIService(config, accounts)
+	service.runImport(remote["id"].(string), remote, []string{"123"})
+	job := config.GetImportJob(remote["id"].(string))
+	if job["status"] != "failed" || len(anyList(job["errors"])) == 0 {
+		t.Fatalf("import job = %#v, want failed persistence error", job)
+	}
+}

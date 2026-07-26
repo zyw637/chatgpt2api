@@ -3,6 +3,7 @@ package backend
 import (
 	"bytes"
 	"context"
+	"crypto/sha256"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -10,6 +11,7 @@ import (
 	"regexp"
 	"sort"
 	"strings"
+	"sync"
 	"time"
 
 	"chatgpt2api/internal/contextoffload"
@@ -21,20 +23,33 @@ const (
 	DefaultClientVersion     = "prod-be885abbfcfe7b1f511e88b3003d9ee44757fbad"
 	DefaultClientBuildNumber = "5955942"
 
-	browserUserAgent              = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/145.0.0.0 Safari/537.36"
-	browserSecCHUA                = `"Not:A-Brand";v="99", "Google Chrome";v="145", "Chromium";v="145"`
-	browserSecCHUAFullVersion     = `"145.0.0.0"`
-	browserSecCHUAFullVersionList = `"Not:A-Brand";v="99.0.0.0", "Google Chrome";v="145.0.0.0", "Chromium";v="145.0.0.0"`
+	// Align defaults with the Python upstream (basketikun/chatgpt2api):
+	// Edge UA + chrome110-style TLS impersonation, which currently passes CF
+	// more reliably than chrome145 under the same proxy.
+	browserUserAgent = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 " +
+		"(KHTML, like Gecko) Chrome/143.0.0.0 Safari/537.36 Edg/143.0.0.0"
+	browserSecCHUA                = `"Microsoft Edge";v="143", "Chromium";v="143", "Not A(Brand";v="24"`
+	browserSecCHUAFullVersion     = `"143.0.3650.96"`
+	browserSecCHUAFullVersionList = `"Microsoft Edge";v="143.0.3650.96", "Chromium";v="143.0.7499.147", "Not A(Brand";v="24.0.0.0"`
 	browserSecCHUAMobile          = "?0"
 	browserSecCHUAPlatform        = `"Windows"`
 	browserSecCHUAPlatformVersion = `"19.0.0"`
 	browserSecCHUAArch            = `"x86"`
 	browserSecCHUABitness         = `"64"`
-	browserImpersonationProfile   = "chrome145"
+	browserImpersonationProfile   = "chrome110"
+	bootstrapChallengeAttempts    = 4
+	clientPoolTTL                 = 30 * time.Minute
 )
 
 type AccountLookup interface {
 	GetAccount(accessToken string) map[string]any
+}
+
+// AccountFingerprintStore is optionally implemented by account services so the
+// backend can persist stable device/session fingerprints across requests.
+type AccountFingerprintStore interface {
+	AccountLookup
+	UpdateAccount(accessToken string, updates map[string]any) (map[string]any, error)
 }
 
 type Client struct {
@@ -46,12 +61,69 @@ type Client struct {
 	lookup       AccountLookup
 	proxy        *service.ProxyService
 	httpClient   *http.Client
+	httpTimeout  time.Duration
 	fp           map[string]string
 	userAgent    string
 	deviceID     string
 	sessionID    string
 	powSources   []string
 	powDataBuild string
+	bootstrapped bool
+	poolKey      string
+	mu           sync.Mutex
+}
+
+type pooledClientEntry struct {
+	client   *Client
+	mu       sync.Mutex
+	lastUsed time.Time
+	proxyURL string
+}
+
+var (
+	clientPoolMu sync.Mutex
+	clientPool   = map[string]*pooledClientEntry{}
+
+	// browserHTTPTimeoutGetter supplies the per-request HTTP timeout for
+	// upstream ChatGPT browser clients. When unset, defaultBrowserHTTPTimeout
+	// is used. Wired from settings image_task_timeout_seconds so long image
+	// generations are not cut off by the historical hard-coded 300s.
+	browserHTTPTimeoutMu     sync.RWMutex
+	browserHTTPTimeoutGetter func() time.Duration
+)
+
+const (
+	defaultBrowserHTTPTimeout = 300 * time.Second
+	minBrowserHTTPTimeout     = 30 * time.Second
+	maxBrowserHTTPTimeout     = 3600 * time.Second
+)
+
+// SetBrowserHTTPTimeoutGetter configures the dynamic upstream HTTP timeout.
+// Pass nil to restore the default (300s). Safe to call at process startup.
+func SetBrowserHTTPTimeoutGetter(getter func() time.Duration) {
+	browserHTTPTimeoutMu.Lock()
+	browserHTTPTimeoutGetter = getter
+	browserHTTPTimeoutMu.Unlock()
+}
+
+func browserHTTPTimeout() time.Duration {
+	browserHTTPTimeoutMu.RLock()
+	getter := browserHTTPTimeoutGetter
+	browserHTTPTimeoutMu.RUnlock()
+	if getter == nil {
+		return defaultBrowserHTTPTimeout
+	}
+	timeout := getter()
+	if timeout <= 0 {
+		return defaultBrowserHTTPTimeout
+	}
+	if timeout < minBrowserHTTPTimeout {
+		return minBrowserHTTPTimeout
+	}
+	if timeout > maxBrowserHTTPTimeout {
+		return maxBrowserHTTPTimeout
+	}
+	return timeout
 }
 
 type ChatRequirements struct {
@@ -63,6 +135,31 @@ type ChatRequirements struct {
 }
 
 func NewClient(accessToken string, lookup AccountLookup, proxy *service.ProxyService) *Client {
+	accessToken = strings.TrimSpace(accessToken)
+	proxyURL := ""
+	if proxy != nil {
+		proxyURL = strings.TrimSpace(proxyURLFromService(proxy))
+	}
+	poolKey := clientPoolKey(accessToken, proxyURL)
+
+	if poolKey != "" {
+		if cached := getPooledClient(poolKey, proxyURL); cached != nil {
+			// Settings may change after a client was pooled; keep the HTTP
+			// timeout aligned with the current image-task timeout.
+			cached.ensureBrowserHTTPTimeout()
+			return cached
+		}
+	}
+
+	c := newClientUncached(accessToken, lookup, proxy)
+	c.poolKey = poolKey
+	if poolKey != "" {
+		putPooledClient(poolKey, proxyURL, c)
+	}
+	return c
+}
+
+func newClientUncached(accessToken string, lookup AccountLookup, proxy *service.ProxyService) *Client {
 	c := &Client{
 		BaseURL:           "https://chatgpt.com",
 		ClientVersion:     DefaultClientVersion,
@@ -76,8 +173,134 @@ func NewClient(accessToken string, lookup AccountLookup, proxy *service.ProxySer
 	c.userAgent = c.fp["user-agent"]
 	c.deviceID = c.fp["oai-device-id"]
 	c.sessionID = c.fp["oai-session-id"]
-	c.httpClient = proxy.BrowserHTTPClientWithProfile(c.fp["impersonate"], 300*time.Second)
+	c.httpClient = c.newBrowserHTTPClient()
+	c.persistFingerprintIfNeeded()
 	return c
+}
+
+func proxyURLFromService(proxy *service.ProxyService) string {
+	if proxy == nil {
+		return ""
+	}
+	return strings.TrimSpace(proxy.ProxyURL())
+}
+
+func clientPoolKey(accessToken, proxyURL string) string {
+	if strings.TrimSpace(accessToken) == "" {
+		// Anonymous clients are short-lived; avoid sharing one jar across unrelated calls.
+		return ""
+	}
+	return "tok:" + accessToken + "|proxy:" + proxyURL
+}
+
+func getPooledClient(key, proxyURL string) *Client {
+	clientPoolMu.Lock()
+	defer clientPoolMu.Unlock()
+	entry, ok := clientPool[key]
+	if !ok || entry == nil || entry.client == nil {
+		return nil
+	}
+	if entry.proxyURL != proxyURL || time.Since(entry.lastUsed) > clientPoolTTL {
+		delete(clientPool, key)
+		return nil
+	}
+	entry.lastUsed = time.Now()
+	return entry.client
+}
+
+func putPooledClient(key, proxyURL string, client *Client) {
+	if key == "" || client == nil {
+		return
+	}
+	clientPoolMu.Lock()
+	defer clientPoolMu.Unlock()
+	clientPool[key] = &pooledClientEntry{
+		client:   client,
+		lastUsed: time.Now(),
+		proxyURL: proxyURL,
+	}
+	// Opportunistic cleanup of stale entries.
+	if len(clientPool) > 64 {
+		now := time.Now()
+		for k, entry := range clientPool {
+			if entry == nil || now.Sub(entry.lastUsed) > clientPoolTTL {
+				delete(clientPool, k)
+			}
+		}
+	}
+}
+
+func invalidatePooledClient(key string) {
+	if key == "" {
+		return
+	}
+	clientPoolMu.Lock()
+	delete(clientPool, key)
+	clientPoolMu.Unlock()
+}
+
+func (c *Client) newBrowserHTTPClient() *http.Client {
+	timeout := browserHTTPTimeout()
+	c.httpTimeout = timeout
+	if c.proxy == nil {
+		return &http.Client{Timeout: timeout}
+	}
+	profile := browserImpersonationProfile
+	if c.fp != nil {
+		if value := strings.TrimSpace(c.fp["impersonate"]); value != "" {
+			profile = value
+		}
+	}
+	return c.proxy.BrowserHTTPClientWithProfile(profile, timeout)
+}
+
+// ensureBrowserHTTPTimeout rebuilds the managed browser HTTP client when the
+// configured timeout has changed (e.g. after settings save). Test clients that
+// inject a custom httpClient without a ProxyService only update Timeout.
+func (c *Client) ensureBrowserHTTPTimeout() {
+	if c == nil {
+		return
+	}
+	desired := browserHTTPTimeout()
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if c.httpClient != nil && c.httpTimeout == desired {
+		return
+	}
+	c.httpTimeout = desired
+	if c.proxy == nil {
+		if c.httpClient != nil {
+			c.httpClient.Timeout = desired
+		} else {
+			c.httpClient = &http.Client{Timeout: desired}
+		}
+		return
+	}
+	profile := browserImpersonationProfile
+	if c.fp != nil {
+		if value := strings.TrimSpace(c.fp["impersonate"]); value != "" {
+			profile = value
+		}
+	}
+	c.httpClient = c.proxy.BrowserHTTPClientWithProfile(profile, desired)
+	c.bootstrapped = false
+	c.powSources = nil
+	c.powDataBuild = ""
+}
+
+func (c *Client) recreateHTTPClient() {
+	// Tests and custom transports inject httpClient without a ProxyService.
+	// Only rebuild when we own the browser client construction path.
+	if c.proxy == nil {
+		c.bootstrapped = false
+		c.powSources = nil
+		c.powDataBuild = ""
+		return
+	}
+	c.httpClient = c.newBrowserHTTPClient()
+	c.bootstrapped = false
+	c.powSources = nil
+	c.powDataBuild = ""
 }
 
 func (c *Client) ListModels(ctx context.Context) (map[string]any, error) {
@@ -212,11 +435,15 @@ func (c *Client) buildFingerprint() map[string]string {
 			fp[key] = value
 		}
 	}
+	// Prefer a stable device/session id per access token so repeated image
+	// generations do not look like a brand-new browser every request.
+	stableDevice := stableIDForToken(c.AccessToken, "device")
+	stableSession := stableIDForToken(c.AccessToken, "session")
 	defaults := map[string]string{
 		"user-agent":         browserUserAgent,
 		"impersonate":        browserImpersonationProfile,
-		"oai-device-id":      util.NewUUID(),
-		"oai-session-id":     util.NewUUID(),
+		"oai-device-id":      firstNonEmpty(stableDevice, util.NewUUID()),
+		"oai-session-id":     firstNonEmpty(stableSession, util.NewUUID()),
 		"sec-ch-ua-mobile":   browserSecCHUAMobile,
 		"sec-ch-ua-platform": browserSecCHUAPlatform,
 	}
@@ -226,6 +453,54 @@ func (c *Client) buildFingerprint() map[string]string {
 		}
 	}
 	return fp
+}
+
+func stableIDForToken(accessToken, kind string) string {
+	accessToken = strings.TrimSpace(accessToken)
+	if accessToken == "" {
+		return ""
+	}
+	sum := sha256.Sum256([]byte(kind + ":" + accessToken))
+	// UUID-shaped hex so it matches existing oai-device-id expectations.
+	hex := fmt.Sprintf("%x", sum[:16])
+	return fmt.Sprintf("%s-%s-%s-%s-%s", hex[0:8], hex[8:12], hex[12:16], hex[16:20], hex[20:32])
+}
+
+func (c *Client) persistFingerprintIfNeeded() {
+	if c == nil || c.AccessToken == "" || c.fp == nil {
+		return
+	}
+	store, ok := c.lookup.(AccountFingerprintStore)
+	if !ok || store == nil {
+		return
+	}
+	account := store.GetAccount(c.AccessToken)
+	if account == nil {
+		return
+	}
+	existing := map[string]any{}
+	if raw, ok := account["fp"].(map[string]any); ok {
+		for key, value := range raw {
+			existing[key] = value
+		}
+	}
+	changed := false
+	for _, key := range []string{"user-agent", "impersonate", "oai-device-id", "oai-session-id", "sec-ch-ua", "sec-ch-ua-mobile", "sec-ch-ua-platform"} {
+		want := strings.TrimSpace(c.fp[key])
+		if want == "" {
+			continue
+		}
+		have := util.Clean(existing[key])
+		if have == "" {
+			existing[key] = want
+			changed = true
+		}
+	}
+	if !changed {
+		return
+	}
+	// Best-effort persist; failure must not break the request path.
+	_, _ = store.UpdateAccount(c.AccessToken, map[string]any{"fp": existing})
 }
 
 func (c *Client) applyBrowserFingerprint() {
@@ -378,24 +653,63 @@ func (c *Client) bootstrapHeaders() map[string]string {
 }
 
 func (c *Client) bootstrap(ctx context.Context) error {
-	req, _ := http.NewRequestWithContext(ctx, http.MethodGet, c.BaseURL+"/", nil)
-	for key, value := range c.bootstrapHeaders() {
-		req.Header.Set(key, value)
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if c.bootstrapped && len(c.powSources) > 0 {
+		return nil
 	}
-	resp, err := c.httpClient.Do(req)
-	if err != nil {
-		return upstreamTransportError("bootstrap", err)
+	var lastChallengeBody []byte
+	for attempt := 0; attempt < bootstrapChallengeAttempts; attempt++ {
+		if attempt > 0 {
+			// Rebuild browser client between CF challenge retries so we drop a
+			// half-initialized jar/session and pick a fresh TLS connection.
+			c.recreateHTTPClient()
+		}
+		req, _ := http.NewRequestWithContext(ctx, http.MethodGet, c.BaseURL+"/", nil)
+		for key, value := range c.bootstrapHeaders() {
+			req.Header.Set(key, value)
+		}
+		resp, err := c.httpClient.Do(req)
+		if err != nil {
+			return upstreamTransportError("bootstrap", err)
+		}
+		data, _ := io.ReadAll(resp.Body)
+		resp.Body.Close()
+		if resp.StatusCode >= 200 && resp.StatusCode < 300 {
+			if isCloudflareChallengeBody(strings.ToLower(string(data))) {
+				// Some edges return 200 with an interstitial challenge page.
+				lastChallengeBody = data
+				c.powSources = []string{defaultPOWScript}
+			} else {
+				c.powSources, c.powDataBuild = parsePOWResources(string(data))
+				if len(c.powSources) == 0 {
+					c.powSources = []string{defaultPOWScript}
+				}
+				c.bootstrapped = true
+				return nil
+			}
+		} else if resp.StatusCode != http.StatusForbidden || !isCloudflareChallengeBody(strings.ToLower(string(data))) {
+			return upstreamHTTPError("bootstrap", resp.StatusCode, data)
+		} else {
+			lastChallengeBody = data
+			c.powSources = []string{defaultPOWScript}
+		}
+		if attempt+1 < bootstrapChallengeAttempts {
+			// Backoff between CF challenges: 300ms, 600ms, 1.2s, ...
+			// Avoid tight retry loops without making unit tests multi-second.
+			delay := time.Duration(300*(1<<attempt)) * time.Millisecond
+			timer := time.NewTimer(delay)
+			select {
+			case <-ctx.Done():
+				timer.Stop()
+				return ctx.Err()
+			case <-timer.C:
+			}
+		}
 	}
-	defer resp.Body.Close()
-	data, _ := io.ReadAll(resp.Body)
-	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
-		return upstreamHTTPError("bootstrap", resp.StatusCode, data)
-	}
-	c.powSources, c.powDataBuild = parsePOWResources(string(data))
-	if len(c.powSources) == 0 {
-		c.powSources = []string{defaultPOWScript}
-	}
-	return nil
+	invalidatePooledClient(c.poolKey)
+	c.bootstrapped = false
+	return upstreamHTTPError("bootstrap", http.StatusForbidden, lastChallengeBody)
 }
 
 func (c *Client) getChatRequirements(ctx context.Context) (ChatRequirements, error) {

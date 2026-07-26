@@ -5,6 +5,7 @@ import (
 	"context"
 	"encoding/base64"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"math/rand"
@@ -72,12 +73,14 @@ type AccountService struct {
 	textCooldownUntil         time.Time
 	random                    *rand.Rand
 	refresher                 *SessionRefresher
+	initErr                   error
 }
 
 const (
-	defaultRemoteUserAgent = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/145.0.0.0 Safari/537.36"
-	defaultRemoteSecCHUA   = `"Not:A-Brand";v="99", "Google Chrome";v="145", "Chromium";v="145"`
-	defaultRemoteProfile   = "chrome145"
+	defaultRemoteUserAgent = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 " +
+		"(KHTML, like Gecko) Chrome/143.0.0.0 Safari/537.36 Edg/143.0.0.0"
+	defaultRemoteSecCHUA = `"Microsoft Edge";v="143", "Chromium";v="143", "Not A(Brand";v="24"`
+	defaultRemoteProfile = "chrome110"
 )
 
 func NewAccountService(backend storage.Backend, config AccountConfig, proxy *ProxyService, logs *LogService) *AccountService {
@@ -111,8 +114,14 @@ func NewAccountService(backend storage.Backend, config AccountConfig, proxy *Pro
 		}
 		return client.Do(req)
 	})
-	s.items = s.loadAccounts()
+	if s.items, s.initErr = s.loadAccounts(); s.initErr != nil {
+		s.items = []map[string]any{}
+	}
 	return s
+}
+
+func (s *AccountService) InitializationError() error {
+	return s.initErr
 }
 
 func (s *AccountService) ListTokens() []string {
@@ -201,12 +210,13 @@ func (s *AccountService) listRefreshableLimitedTokens(now time.Time) []string {
 	return out
 }
 
-func (s *AccountService) AddAccounts(tokens []string) map[string]any {
+func (s *AccountService) AddAccounts(tokens []string) (map[string]any, error) {
 	cleaned := cleanTokens(tokens)
 	if len(cleaned) == 0 {
-		return map[string]any{"added": 0, "skipped": 0, "items": s.ListAccounts()}
+		return map[string]any{"added": 0, "skipped": 0, "items": s.ListAccounts()}, nil
 	}
 	s.mu.Lock()
+	previousItems := copyMaps(s.items)
 	indexed := map[string]map[string]any{}
 	order := make([]string, 0, len(s.items)+len(cleaned))
 	for _, item := range s.items {
@@ -246,7 +256,11 @@ func (s *AccountService) AddAccounts(tokens []string) map[string]any {
 		next = append(next, indexed[token])
 	}
 	s.items = next
-	_ = s.saveLocked()
+	if err := s.saveLocked(); err != nil {
+		s.items = previousItems
+		s.mu.Unlock()
+		return nil, err
+	}
 	items := publicAccounts(s.items)
 	s.mu.Unlock()
 	s.logs.Add(fmt.Sprintf("新增 %d 个账号，跳过 %d 个", added, skipped), map[string]any{
@@ -255,7 +269,7 @@ func (s *AccountService) AddAccounts(tokens []string) map[string]any {
 		"added":          added,
 		"skipped":        skipped,
 	})
-	return map[string]any{"added": added, "skipped": skipped, "items": items}
+	return map[string]any{"added": added, "skipped": skipped, "items": items}, nil
 }
 
 func (s *AccountService) AddAccountFromSession(sessionJSON string) (map[string]any, error) {
@@ -312,15 +326,29 @@ func (s *AccountService) AddAccountFromSession(sessionJSON string) (map[string]a
 
 	matchedToken := s.findSessionImportAccountToken(accessToken, userID, email)
 	result := map[string]any{"added": 0, "skipped": 0, "updated": 0, "items": s.ListAccounts()}
+	var item map[string]any
 	if matchedToken != "" {
-		if !s.UpdateAccountFromSessionImport(matchedToken, accessToken, updates, true) {
+		updated, err := s.UpdateAccountFromSessionImport(matchedToken, accessToken, updates, true)
+		if err != nil {
+			return nil, err
+		}
+		if !updated {
 			return nil, fmt.Errorf("session account update failed")
 		}
 		result["updated"] = 1
+		item = s.GetAccount(accessToken)
 	} else {
-		result = s.AddAccounts([]string{accessToken})
+		result, err = s.AddAccounts([]string{accessToken})
+		if err != nil {
+			return nil, err
+		}
+		item, err = s.UpdateAccount(accessToken, updates)
+		if err != nil {
+			_, rollbackErr := s.DeleteAccounts([]string{accessToken})
+			return nil, errors.Join(err, rollbackErr)
+		}
 	}
-	if item := s.UpdateAccount(accessToken, updates); item != nil {
+	if item != nil {
 		publicItems := publicAccounts([]map[string]any{item})
 		if len(publicItems) > 0 {
 			result["item"] = publicItems[0]
@@ -368,25 +396,25 @@ func (s *AccountService) findSessionImportAccountToken(accessToken, userID, emai
 	return ""
 }
 
-func (s *AccountService) DeleteAccounts(tokens []string) map[string]any {
+func (s *AccountService) DeleteAccounts(tokens []string) (map[string]any, error) {
 	targets := map[string]struct{}{}
 	for _, token := range cleanTokens(tokens) {
 		targets[token] = struct{}{}
 	}
 	if len(targets) == 0 {
-		return map[string]any{"removed": 0, "items": s.ListAccounts()}
+		return map[string]any{"removed": 0, "items": s.ListAccounts()}, nil
 	}
 	s.mu.Lock()
-	next := s.items[:0]
+	previousItems := copyMaps(s.items)
+	previousIndex := s.index
+	next := make([]map[string]any, 0, len(s.items))
+	removedTokens := make([]string, 0, len(targets))
 	removed := 0
 	for _, item := range s.items {
 		token := util.Clean(item["access_token"])
 		if _, ok := targets[token]; ok {
 			removed++
-			s.clearImageReservationLocked(token)
-			s.clearBusyTokenLocked(token)
-			delete(s.textRequestCount, token)
-			s.clearStickyLocked(token, true, true)
+			removedTokens = append(removedTokens, token)
 			continue
 		}
 		next = append(next, item)
@@ -398,7 +426,18 @@ func (s *AccountService) DeleteAccounts(tokens []string) map[string]any {
 		s.index = 0
 	}
 	if removed > 0 {
-		_ = s.saveLocked()
+		if err := s.saveLocked(); err != nil {
+			s.items = previousItems
+			s.index = previousIndex
+			s.mu.Unlock()
+			return nil, err
+		}
+		for _, token := range removedTokens {
+			s.clearImageReservationLocked(token)
+			s.clearBusyTokenLocked(token)
+			delete(s.textRequestCount, token)
+			s.clearStickyLocked(token, true, true)
+		}
 	}
 	items := publicAccounts(s.items)
 	s.mu.Unlock()
@@ -409,18 +448,20 @@ func (s *AccountService) DeleteAccounts(tokens []string) map[string]any {
 			"removed":        removed,
 		})
 	}
-	return map[string]any{"removed": removed, "items": items}
+	return map[string]any{"removed": removed, "items": items}, nil
 }
 
-func (s *AccountService) SetAccountsEnabledByIDs(ids []string, enabled bool) map[string]any {
+func (s *AccountService) SetAccountsEnabledByIDs(ids []string, enabled bool) (map[string]any, error) {
 	targets := cleanAccountIDs(ids)
 	if len(targets) == 0 {
-		return map[string]any{"updated": 0, "skipped": 0, "items": s.ListAccounts()}
+		return map[string]any{"updated": 0, "skipped": 0, "items": s.ListAccounts()}, nil
 	}
 
 	s.mu.Lock()
+	previousItems := copyMaps(s.items)
 	updated, skipped := 0, 0
 	seen := map[string]struct{}{}
+	disabledTokens := []string{}
 	changed := false
 	for _, item := range s.items {
 		token := util.Clean(item["access_token"])
@@ -438,73 +479,88 @@ func (s *AccountService) SetAccountsEnabledByIDs(ids []string, enabled bool) map
 		}
 		item["enabled"] = enabled
 		if !enabled {
-			s.clearImageReservationLocked(token)
-			s.clearBusyTokenLocked(token)
-			s.clearStickyLocked(token, true, true)
+			disabledTokens = append(disabledTokens, token)
 		}
 		updated++
 		changed = true
 	}
 	skipped += len(targets) - len(seen)
 	if changed {
-		_ = s.saveLocked()
+		if err := s.saveLocked(); err != nil {
+			s.items = previousItems
+			s.mu.Unlock()
+			return nil, err
+		}
+		for _, token := range disabledTokens {
+			s.clearImageReservationLocked(token)
+			s.clearBusyTokenLocked(token)
+			s.clearStickyLocked(token, true, true)
+		}
 	}
 	items := publicAccounts(s.items)
 	s.mu.Unlock()
-	return map[string]any{"updated": updated, "skipped": skipped, "items": items}
+	return map[string]any{"updated": updated, "skipped": skipped, "items": items}, nil
 }
 
 func (s *AccountService) RemoveToken(token string) bool {
-	return util.ToInt(s.DeleteAccounts([]string{token})["removed"], 0) > 0
+	result, _ := s.DeleteAccounts([]string{token})
+	return util.ToInt(result["removed"], 0) > 0
 }
 
-func (s *AccountService) UpdateAccount(accessToken string, updates map[string]any) map[string]any {
+func (s *AccountService) UpdateAccount(accessToken string, updates map[string]any) (map[string]any, error) {
 	accessToken = util.Clean(accessToken)
 	if accessToken == "" {
-		return nil
+		return nil, nil
 	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	idx := s.findIndexLocked(accessToken)
 	if idx < 0 {
-		return nil
+		return nil, nil
 	}
 	account := normalizeAccount(mergeMaps(s.items[idx], updates, map[string]any{"access_token": accessToken}))
 	if account == nil {
-		return nil
+		return nil, nil
 	}
+	previousItems := copyMaps(s.items)
 	if account["status"] == "限流" && s.config.AutoRemoveRateLimitedAccounts() {
+		s.items = append(s.items[:idx], s.items[idx+1:]...)
+		if err := s.saveLocked(); err != nil {
+			s.items = previousItems
+			return nil, err
+		}
 		s.clearImageReservationLocked(accessToken)
 		s.clearBusyTokenLocked(accessToken)
 		s.clearStickyLocked(accessToken, true, true)
-		s.items = append(s.items[:idx], s.items[idx+1:]...)
-		_ = s.saveLocked()
 		s.logs.Add("自动移除限流账号", map[string]any{
 			"module":         "accounts",
 			"operation_type": "自动移除",
 			"token":          util.AnonymizeToken(accessToken),
 		})
-		return nil
+		return nil, nil
+	}
+	s.items[idx] = account
+	if err := s.saveLocked(); err != nil {
+		s.items = previousItems
+		return nil, err
 	}
 	if status := util.Clean(account["status"]); status == "异常" || status == "限流" || status == "禁用" || status == "刷新中" || status == "过期待刷新" {
 		s.clearStickyLocked(accessToken, true, true)
 	}
-	s.items[idx] = account
-	_ = s.saveLocked()
 	s.logs.Add("更新账号", map[string]any{
 		"module":         "accounts",
 		"operation_type": "更新",
 		"token":          util.AnonymizeToken(accessToken),
 		"status":         account["status"],
 	})
-	return util.CopyMap(account)
+	return util.CopyMap(account), nil
 }
 
-func (s *AccountService) UpdateAccountFromSessionImport(oldAccessToken, newAccessToken string, updates map[string]any, recoverStatus bool) bool {
+func (s *AccountService) UpdateAccountFromSessionImport(oldAccessToken, newAccessToken string, updates map[string]any, recoverStatus bool) (bool, error) {
 	oldAccessToken = util.Clean(oldAccessToken)
 	newAccessToken = util.Clean(newAccessToken)
 	if oldAccessToken == "" || newAccessToken == "" {
-		return false
+		return false, nil
 	}
 
 	s.mu.Lock()
@@ -512,8 +568,9 @@ func (s *AccountService) UpdateAccountFromSessionImport(oldAccessToken, newAcces
 
 	idx := s.findIndexLocked(oldAccessToken)
 	if idx < 0 {
-		return false
+		return false, nil
 	}
+	previousItems := copyMaps(s.items)
 	if oldAccessToken != newAccessToken {
 		if duplicateIdx := s.findIndexLocked(newAccessToken); duplicateIdx >= 0 && duplicateIdx != idx {
 			s.items = append(s.items[:duplicateIdx], s.items[duplicateIdx+1:]...)
@@ -529,9 +586,13 @@ func (s *AccountService) UpdateAccountFromSessionImport(oldAccessToken, newAcces
 	}
 	account := normalizeAccount(mergeMaps(s.items[idx], accountUpdates))
 	if account == nil {
-		return false
+		return false, nil
 	}
 	s.items[idx] = account
+	if err := s.saveLocked(); err != nil {
+		s.items = previousItems
+		return false, err
+	}
 	if oldAccessToken != newAccessToken {
 		s.migrateImageReservationLocked(oldAccessToken, newAccessToken)
 		s.migrateBusyTokenLocked(oldAccessToken, newAccessToken)
@@ -546,14 +607,13 @@ func (s *AccountService) UpdateAccountFromSessionImport(oldAccessToken, newAcces
 			s.stickyImageToken = newAccessToken
 		}
 	}
-	_ = s.saveLocked()
 	s.logs.Add("更新Session账号", map[string]any{
 		"module":         "accounts",
 		"operation_type": "更新",
 		"token":          util.AnonymizeToken(newAccessToken),
 		"status":         account["status"],
 	})
-	return true
+	return true, nil
 }
 
 func (s *AccountService) GetAccount(accessToken string) map[string]any {
@@ -624,7 +684,7 @@ func (s *AccountService) HandleTokenExpiredOnRequest(expiredToken string) (newTo
 	if sessionToken == "" {
 		return "", false
 	}
-	if s.UpdateAccount(expiredToken, map[string]any{"status": "刷新中"}) == nil {
+	if item, _ := s.UpdateAccount(expiredToken, map[string]any{"status": "刷新中"}); item == nil {
 		return "", false
 	}
 	s.refreshAccountViaSessionAsync(expiredToken, sessionToken)
@@ -918,7 +978,7 @@ func (s *AccountService) RefreshAccountState(ctx context.Context, accessToken st
 		}
 		return nil, err
 	}
-	return s.UpdateAccount(accessToken, remote), nil
+	return s.UpdateAccount(accessToken, remote)
 }
 
 type pendingRefreshItem struct {
@@ -996,7 +1056,7 @@ func (s *AccountService) RefreshAccounts(ctx context.Context, accessTokens []str
 		}
 		detailsByToken[token] = detail
 		if res.err == nil {
-			updated := s.UpdateAccount(res.token, res.info)
+			updated, _ := s.UpdateAccount(res.token, res.info)
 			if updated != nil {
 				refreshed++
 				detail["account_status"] = updated["status"]
@@ -1169,11 +1229,15 @@ func (s *AccountService) MarkImageResult(accessToken string, success bool) map[s
 		return nil
 	}
 	if account["status"] == "限流" && s.config.AutoRemoveRateLimitedAccounts() {
+		previousItems := copyMaps(s.items)
 		s.clearImageReservationLocked(resolvedToken)
 		s.clearBusyTokenLocked(resolvedToken)
 		s.clearStickyLocked(resolvedToken, true, true)
 		s.items = append(s.items[:idx], s.items[idx+1:]...)
-		_ = s.saveLocked()
+		if err := s.saveLocked(); err != nil {
+			s.items = previousItems
+			return nil
+		}
 		s.logs.Add("自动移除限流账号", map[string]any{
 			"module":         "accounts",
 			"operation_type": "自动移除",
@@ -1181,8 +1245,12 @@ func (s *AccountService) MarkImageResult(accessToken string, success bool) map[s
 		})
 		return nil
 	}
+	previous := s.items[idx]
 	s.items[idx] = account
-	_ = s.saveLocked()
+	if err := s.saveLocked(); err != nil {
+		s.items[idx] = previous
+		return nil
+	}
 	return util.CopyMap(account)
 }
 
@@ -1260,6 +1328,7 @@ func (s *AccountService) RefreshAccountViaSession(accessToken, newAccessToken, n
 
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	previousItems := copyMaps(s.items)
 
 	idx := s.findIndexLocked(accessToken)
 	if idx < 0 {
@@ -1284,6 +1353,10 @@ func (s *AccountService) RefreshAccountViaSession(accessToken, newAccessToken, n
 		return false
 	}
 	s.items[idx] = account
+	if err := s.saveLocked(); err != nil {
+		s.items = previousItems
+		return false
+	}
 	if accessToken != newAccessToken {
 		s.migrateImageReservationLocked(accessToken, newAccessToken)
 		s.migrateBusyTokenLocked(accessToken, newAccessToken)
@@ -1298,7 +1371,6 @@ func (s *AccountService) RefreshAccountViaSession(accessToken, newAccessToken, n
 			s.stickyImageToken = newAccessToken
 		}
 	}
-	_ = s.saveLocked()
 	s.logs.Add("刷新账号token", map[string]any{
 		"module":         "accounts",
 		"operation_type": "更新",
@@ -1978,10 +2050,10 @@ func (s *AccountService) findIndexLocked(accessToken string) int {
 	return -1
 }
 
-func (s *AccountService) loadAccounts() []map[string]any {
+func (s *AccountService) loadAccounts() ([]map[string]any, error) {
 	items, err := s.storage.LoadAccounts()
 	if err != nil {
-		return []map[string]any{}
+		return nil, err
 	}
 	out := make([]map[string]any, 0, len(items))
 	for _, item := range items {
@@ -1989,7 +2061,7 @@ func (s *AccountService) loadAccounts() []map[string]any {
 			out = append(out, normalized)
 		}
 	}
-	return out
+	return out, nil
 }
 
 func (s *AccountService) saveLocked() error {

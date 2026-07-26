@@ -17,6 +17,15 @@ import (
 	"chatgpt2api/internal/util"
 )
 
+func TestAccountServiceReportsInitializationFailure(t *testing.T) {
+	backend := newFailingStorageBackend(t)
+	backend.failAccountsLoad = true
+	service := NewAccountService(backend, nil, nil, nil)
+	if service.InitializationError() == nil {
+		t.Fatal("InitializationError() = nil")
+	}
+}
+
 type testAccountConfig struct {
 	textMode  string
 	imageMode string
@@ -1385,7 +1394,7 @@ func TestUpdateAccountFromSessionImportMigratesImageReservationOldRelease(t *tes
 	accounts.textRequestCount["old-token"] = 2
 	accounts.textRequestCount["new-token"] = 3
 
-	if !accounts.UpdateAccountFromSessionImport("old-token", "new-token", map[string]any{"session_token": "new-session"}, true) {
+	if updated, _ := accounts.UpdateAccountFromSessionImport("old-token", "new-token", map[string]any{"session_token": "new-session"}, true); !updated {
 		t.Fatal("UpdateAccountFromSessionImport() = false")
 	}
 	if got := accounts.imageReservations["new-token"]; got != 2 {
@@ -1420,7 +1429,7 @@ func TestUpdateAccountFromSessionImportAllowsOldLeaseToReleaseMigratedBusyToken(
 		t.Fatalf("lease token = %q, want old-token", lease.Token)
 	}
 
-	if !accounts.UpdateAccountFromSessionImport("old-token", "new-token", map[string]any{"session_token": "new-session"}, true) {
+	if updated, _ := accounts.UpdateAccountFromSessionImport("old-token", "new-token", map[string]any{"session_token": "new-session"}, true); !updated {
 		lease.Release()
 		t.Fatal("UpdateAccountFromSessionImport() = false")
 	}
@@ -1441,7 +1450,7 @@ func TestSetAccountsEnabledByIDsDisablesSchedulingWithoutChangingStatus(t *testi
 	accounts.UpdateAccount("token-1", map[string]any{"status": "正常", "type": "Plus", "quota": 5})
 
 	id := accountIDFromToken("token-1")
-	result := accounts.SetAccountsEnabledByIDs([]string{id}, false)
+	result, _ := accounts.SetAccountsEnabledByIDs([]string{id}, false)
 	if result["updated"] != 1 || result["skipped"] != 0 {
 		t.Fatalf("disable result = %#v, want updated=1 skipped=0", result)
 	}
@@ -1460,7 +1469,7 @@ func TestSetAccountsEnabledByIDsDisablesSchedulingWithoutChangingStatus(t *testi
 		t.Fatal("disabled account should not be available for text scheduling")
 	}
 
-	result = accounts.SetAccountsEnabledByIDs([]string{id}, true)
+	result, _ = accounts.SetAccountsEnabledByIDs([]string{id}, true)
 	if result["updated"] != 1 || result["skipped"] != 0 {
 		t.Fatalf("enable result = %#v, want updated=1 skipped=0", result)
 	}
@@ -1488,22 +1497,22 @@ func TestSetAccountsEnabledByIDsIsIdempotent(t *testing.T) {
 	accounts.UpdateAccount("token-1", map[string]any{"status": "正常", "type": "Plus", "quota": 5})
 	accounts.UpdateAccount("token-2", map[string]any{"status": "正常", "type": "Plus", "quota": 5, "enabled": false})
 
-	result := accounts.SetAccountsEnabledByIDs([]string{accountIDFromToken("token-1"), accountIDFromToken("token-2")}, false)
+	result, _ := accounts.SetAccountsEnabledByIDs([]string{accountIDFromToken("token-1"), accountIDFromToken("token-2")}, false)
 	if result["updated"] != 1 || result["skipped"] != 1 {
 		t.Fatalf("batch disable result = %#v, want updated=1 skipped=1", result)
 	}
 
-	result = accounts.SetAccountsEnabledByIDs([]string{accountIDFromToken("token-1"), accountIDFromToken("token-2")}, false)
+	result, _ = accounts.SetAccountsEnabledByIDs([]string{accountIDFromToken("token-1"), accountIDFromToken("token-2")}, false)
 	if result["updated"] != 0 || result["skipped"] != 2 {
 		t.Fatalf("repeat disable result = %#v, want updated=0 skipped=2", result)
 	}
 
-	result = accounts.SetAccountsEnabledByIDs([]string{accountIDFromToken("token-1"), accountIDFromToken("token-2")}, true)
+	result, _ = accounts.SetAccountsEnabledByIDs([]string{accountIDFromToken("token-1"), accountIDFromToken("token-2")}, true)
 	if result["updated"] != 2 || result["skipped"] != 0 {
 		t.Fatalf("batch enable result = %#v, want updated=2 skipped=0", result)
 	}
 
-	result = accounts.SetAccountsEnabledByIDs([]string{accountIDFromToken("token-1"), accountIDFromToken("token-2")}, true)
+	result, _ = accounts.SetAccountsEnabledByIDs([]string{accountIDFromToken("token-1"), accountIDFromToken("token-2")}, true)
 	if result["updated"] != 0 || result["skipped"] != 2 {
 		t.Fatalf("repeat enable result = %#v, want updated=0 skipped=2", result)
 	}
@@ -1549,7 +1558,7 @@ func TestLegacyDisabledStatusRemainsUnschedulableAndPubliclyDisabled(t *testing.
 
 func TestAddAccountsDefaultsToEnabledAndListsIt(t *testing.T) {
 	accounts := newTestAccountService(t)
-	result := accounts.AddAccounts([]string{"token-1"})
+	result, _ := accounts.AddAccounts([]string{"token-1"})
 	if result["added"] != 1 || result["skipped"] != 0 {
 		t.Fatalf("AddAccounts() = %#v, want added=1 skipped=0", result)
 	}
@@ -1645,7 +1654,7 @@ func TestSetAccountsEnabledByIDsClearsReservationsAndStickyState(t *testing.T) {
 	accounts.stickyImageToken = "token-1"
 	accounts.mu.Unlock()
 
-	result := accounts.SetAccountsEnabledByIDs([]string{accountIDFromToken("token-1")}, false)
+	result, _ := accounts.SetAccountsEnabledByIDs([]string{accountIDFromToken("token-1")}, false)
 	if result["updated"] != 1 || result["skipped"] != 0 {
 		t.Fatalf("disable result = %#v, want updated=1 skipped=0", result)
 	}
@@ -1673,6 +1682,42 @@ type accountStorageSpy struct {
 	accounts  []map[string]any
 	saveCount int
 	saved     []map[string]any
+}
+
+func TestAccountServicePersistedMutationsRollbackOnSaveFailure(t *testing.T) {
+	backend := newFailingStorageBackend(t)
+	accounts := NewAccountService(
+		backend,
+		testAccountConfig{},
+		NewProxyService(testAccountConfig{}),
+		NewLogService(backend),
+	)
+
+	backend.failAccounts = true
+	if _, err := accounts.AddAccounts([]string{"token-1"}); err == nil {
+		t.Fatal("AddAccounts() succeeded when persistence failed")
+	}
+	if len(accounts.ListAccounts()) != 0 {
+		t.Fatalf("failed add changed accounts: %#v", accounts.ListAccounts())
+	}
+
+	backend.failAccounts = false
+	if _, err := accounts.AddAccounts([]string{"token-1"}); err != nil {
+		t.Fatalf("AddAccounts() error = %v", err)
+	}
+	backend.failAccounts = true
+	if _, err := accounts.UpdateAccount("token-1", map[string]any{"status": "异常"}); err == nil {
+		t.Fatal("UpdateAccount() succeeded when persistence failed")
+	}
+	if status := util.Clean(accounts.GetAccount("token-1")["status"]); status == "异常" {
+		t.Fatalf("failed update changed account status to %q", status)
+	}
+	if _, err := accounts.DeleteAccounts([]string{"token-1"}); err == nil {
+		t.Fatal("DeleteAccounts() succeeded when persistence failed")
+	}
+	if accounts.GetAccount("token-1") == nil {
+		t.Fatal("failed delete removed account from memory")
+	}
 }
 
 func (s *accountStorageSpy) LoadAccounts() ([]map[string]any, error) {

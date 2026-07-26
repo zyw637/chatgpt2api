@@ -18,6 +18,7 @@ type CPAConfig struct {
 	store   storage.JSONDocumentBackend
 	pools   []map[string]any
 	docName string
+	initErr error
 }
 
 type CPAImportService struct {
@@ -26,11 +27,24 @@ type CPAImportService struct {
 	proxy    *ProxyService
 }
 
+type ImportJobPersistenceError struct {
+	Target string
+	Err    error
+}
+
+func (e ImportJobPersistenceError) Error() string {
+	return fmt.Sprintf("persist %s import job: %v", e.Target, e.Err)
+}
+
+func (e ImportJobPersistenceError) Unwrap() error { return e.Err }
+
 func NewCPAConfig(backend ...storage.Backend) *CPAConfig {
 	c := &CPAConfig{store: firstJSONDocumentStore(backend), docName: "cpa_config.json"}
-	c.pools = c.load()
+	c.pools, c.initErr = c.load()
 	return c
 }
+
+func (c *CPAConfig) InitializationError() error { return c.initErr }
 
 func NewCPAImportService(config *CPAConfig, accounts *AccountService, proxy *ProxyService) *CPAImportService {
 	return &CPAImportService{config: config, accounts: accounts, proxy: proxy}
@@ -53,16 +67,19 @@ func (c *CPAConfig) GetPool(id string) map[string]any {
 	return nil
 }
 
-func (c *CPAConfig) AddPool(name, baseURL, secretKey string) map[string]any {
+func (c *CPAConfig) AddPool(name, baseURL, secretKey string) (map[string]any, error) {
 	pool := normalizeCPAPool(map[string]any{"id": util.NewHex(12), "name": name, "base_url": baseURL, "secret_key": secretKey})
 	c.mu.Lock()
+	defer c.mu.Unlock()
 	c.pools = append(c.pools, pool)
-	_ = c.saveLocked()
-	c.mu.Unlock()
-	return util.CopyMap(pool)
+	if err := c.saveLocked(); err != nil {
+		c.pools = c.pools[:len(c.pools)-1]
+		return nil, err
+	}
+	return util.CopyMap(pool), nil
 }
 
-func (c *CPAConfig) UpdatePool(id string, updates map[string]any) map[string]any {
+func (c *CPAConfig) UpdatePool(id string, updates map[string]any) (map[string]any, error) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	for index, pool := range c.pools {
@@ -70,16 +87,21 @@ func (c *CPAConfig) UpdatePool(id string, updates map[string]any) map[string]any
 			continue
 		}
 		merged := mergeMaps(pool, updates, map[string]any{"id": id})
-		c.pools[index] = normalizeCPAPool(merged)
-		_ = c.saveLocked()
-		return util.CopyMap(c.pools[index])
+		next := normalizeCPAPool(merged)
+		c.pools[index] = next
+		if err := c.saveLocked(); err != nil {
+			c.pools[index] = pool
+			return nil, err
+		}
+		return util.CopyMap(next), nil
 	}
-	return nil
+	return nil, nil
 }
 
-func (c *CPAConfig) DeletePool(id string) bool {
+func (c *CPAConfig) DeletePool(id string) (bool, error) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
+	previous := append([]map[string]any(nil), c.pools...)
 	next := c.pools[:0]
 	removed := false
 	for _, pool := range c.pools {
@@ -91,12 +113,15 @@ func (c *CPAConfig) DeletePool(id string) bool {
 	}
 	if removed {
 		c.pools = next
-		_ = c.saveLocked()
+		if err := c.saveLocked(); err != nil {
+			c.pools = previous
+			return false, err
+		}
 	}
-	return removed
+	return removed, nil
 }
 
-func (c *CPAConfig) SetImportJob(id string, job map[string]any) map[string]any {
+func (c *CPAConfig) SetImportJob(id string, job map[string]any) (map[string]any, error) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	for index, pool := range c.pools {
@@ -106,10 +131,26 @@ func (c *CPAConfig) SetImportJob(id string, job map[string]any) map[string]any {
 		next := util.CopyMap(pool)
 		next["import_job"] = normalizeImportJob(job, false)
 		c.pools[index] = next
-		_ = c.saveLocked()
-		return util.CopyMap(next)
+		if err := c.saveLocked(); err != nil {
+			c.pools[index] = pool
+			return nil, err
+		}
+		return util.CopyMap(next), nil
 	}
-	return nil
+	return nil, nil
+}
+
+func (c *CPAConfig) setImportJobMemory(id string, job map[string]any) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	for index, pool := range c.pools {
+		if pool["id"] == id {
+			next := util.CopyMap(pool)
+			next["import_job"] = normalizeImportJob(job, false)
+			c.pools[index] = next
+			return
+		}
+	}
 }
 
 func (c *CPAConfig) GetImportJob(id string) map[string]any {
@@ -125,14 +166,20 @@ func (c *CPAConfig) GetImportJob(id string) map[string]any {
 	return nil
 }
 
-func (c *CPAConfig) load() []map[string]any {
-	raw := loadStoredJSON(c.store, c.docName)
+func (c *CPAConfig) load() ([]map[string]any, error) {
+	if c.store == nil {
+		return nil, fmt.Errorf("CPA document backend is required")
+	}
+	raw, err := c.store.LoadJSONDocument(c.docName)
+	if err != nil {
+		return nil, err
+	}
 	if obj, ok := raw.(map[string]any); ok && obj["base_url"] != nil {
 		pool := normalizeCPAPool(obj)
 		if util.Clean(pool["base_url"]) != "" {
-			return []map[string]any{pool}
+			return []map[string]any{pool}, nil
 		}
-		return nil
+		return nil, nil
 	}
 	var pools []map[string]any
 	for _, item := range anyList(raw) {
@@ -140,7 +187,7 @@ func (c *CPAConfig) load() []map[string]any {
 			pools = append(pools, normalizeCPAPool(pool))
 		}
 	}
-	return pools
+	return pools, nil
 }
 
 func (c *CPAConfig) saveLocked() error {
@@ -195,7 +242,10 @@ func (s *CPAImportService) StartImport(pool map[string]any, selected []string) (
 	}
 	poolID := util.Clean(pool["id"])
 	job := newImportJob(len(names))
-	saved := s.config.SetImportJob(poolID, job)
+	saved, err := s.config.SetImportJob(poolID, job)
+	if err != nil {
+		return nil, ImportJobPersistenceError{Target: "CPA pool", Err: err}
+	}
 	if saved == nil {
 		return nil, fmt.Errorf("pool not found")
 	}
@@ -204,7 +254,9 @@ func (s *CPAImportService) StartImport(pool map[string]any, selected []string) (
 }
 
 func (s *CPAImportService) runImport(poolID string, pool map[string]any, names []string) {
-	s.updateJob(poolID, map[string]any{"status": "running"})
+	if err := s.updateJob(poolID, map[string]any{"status": "running"}); err != nil {
+		return
+	}
 	type result struct{ token, name, err string }
 	results := make(chan result, len(names))
 	workers := minInt(16, maxInt(1, len(names)))
@@ -237,20 +289,32 @@ func (s *CPAImportService) runImport(poolID string, pool map[string]any, names [
 		if res.token != "" {
 			tokens = append(tokens, res.token)
 		} else {
-			s.appendJobError(poolID, res.name, res.err)
+			if err := s.appendJobError(poolID, res.name, res.err); err != nil {
+				return
+			}
 		}
 		current := s.config.GetImportJob(poolID)
-		s.updateJob(poolID, map[string]any{"completed": util.ToInt(current["completed"], 0) + 1, "failed": len(anyList(current["errors"]))})
+		if err := s.updateJob(poolID, map[string]any{"completed": util.ToInt(current["completed"], 0) + 1, "failed": len(anyList(current["errors"]))}); err != nil {
+			return
+		}
 	}
 	if len(tokens) == 0 {
 		current := s.config.GetImportJob(poolID)
-		s.updateJob(poolID, map[string]any{"status": "failed", "completed": util.ToInt(current["total"], 0), "failed": len(anyList(current["errors"]))})
+		_ = s.updateJob(poolID, map[string]any{"status": "failed", "completed": util.ToInt(current["total"], 0), "failed": len(anyList(current["errors"]))})
 		return
 	}
-	add := s.accounts.AddAccounts(tokens)
+	add, err := s.accounts.AddAccounts(tokens)
+	if err != nil {
+		if jobErr := s.appendJobError(poolID, "account persistence", err.Error()); jobErr != nil {
+			return
+		}
+		current := s.config.GetImportJob(poolID)
+		_ = s.updateJob(poolID, map[string]any{"status": "failed", "completed": len(names), "failed": len(anyList(current["errors"]))})
+		return
+	}
 	refresh := s.accounts.RefreshAccounts(context.Background(), tokens)
 	current := s.config.GetImportJob(poolID)
-	s.updateJob(poolID, map[string]any{"status": "completed", "completed": len(names), "added": util.ToInt(add["added"], 0), "skipped": util.ToInt(add["skipped"], 0), "refreshed": util.ToInt(refresh["refreshed"], 0), "failed": len(anyList(current["errors"]))})
+	_ = s.updateJob(poolID, map[string]any{"status": "completed", "completed": len(names), "added": util.ToInt(add["added"], 0), "skipped": util.ToInt(add["skipped"], 0), "refreshed": util.ToInt(refresh["refreshed"], 0), "failed": len(anyList(current["errors"]))})
 }
 
 func (s *CPAImportService) fetchRemoteAccessToken(ctx context.Context, pool map[string]any, name string) (string, error) {
@@ -281,26 +345,32 @@ func (s *CPAImportService) fetchRemoteAccessToken(ctx context.Context, pool map[
 	return token, nil
 }
 
-func (s *CPAImportService) updateJob(poolID string, updates map[string]any) {
+func (s *CPAImportService) updateJob(poolID string, updates map[string]any) error {
 	current := s.config.GetImportJob(poolID)
 	if current == nil {
-		return
+		return fmt.Errorf("CPA pool not found")
 	}
 	for key, value := range updates {
 		current[key] = value
 	}
 	current["updated_at"] = util.NowISO()
-	s.config.SetImportJob(poolID, current)
+	if _, err := s.config.SetImportJob(poolID, current); err != nil {
+		current["status"] = "failed"
+		current["persistence_error"] = err.Error()
+		s.config.setImportJobMemory(poolID, current)
+		return ImportJobPersistenceError{Target: "CPA pool", Err: err}
+	}
+	return nil
 }
 
-func (s *CPAImportService) appendJobError(poolID, name, message string) {
+func (s *CPAImportService) appendJobError(poolID, name, message string) error {
 	current := s.config.GetImportJob(poolID)
 	if current == nil {
-		return
+		return fmt.Errorf("CPA pool not found")
 	}
 	errors := anyList(current["errors"])
 	errors = append(errors, map[string]any{"name": name, "error": message})
-	s.updateJob(poolID, map[string]any{"errors": errors, "failed": len(errors)})
+	return s.updateJob(poolID, map[string]any{"errors": errors, "failed": len(errors)})
 }
 
 func normalizeCPAPool(raw map[string]any) map[string]any {
@@ -316,7 +386,11 @@ func normalizeImportJob(raw any, failUnfinished bool) map[string]any {
 	if failUnfinished && (status == "pending" || status == "running") {
 		status = "failed"
 	}
-	return map[string]any{"job_id": firstNonEmpty(util.Clean(item["job_id"]), util.NewHex(32)), "status": status, "created_at": firstNonEmpty(util.Clean(item["created_at"]), util.NowISO()), "updated_at": firstNonEmpty(util.Clean(item["updated_at"]), util.Clean(item["created_at"]), util.NowISO()), "total": util.ToInt(item["total"], 0), "completed": util.ToInt(item["completed"], 0), "added": util.ToInt(item["added"], 0), "skipped": util.ToInt(item["skipped"], 0), "refreshed": util.ToInt(item["refreshed"], 0), "failed": util.ToInt(item["failed"], 0), "errors": anyList(item["errors"])}
+	result := map[string]any{"job_id": firstNonEmpty(util.Clean(item["job_id"]), util.NewHex(32)), "status": status, "created_at": firstNonEmpty(util.Clean(item["created_at"]), util.NowISO()), "updated_at": firstNonEmpty(util.Clean(item["updated_at"]), util.Clean(item["created_at"]), util.NowISO()), "total": util.ToInt(item["total"], 0), "completed": util.ToInt(item["completed"], 0), "added": util.ToInt(item["added"], 0), "skipped": util.ToInt(item["skipped"], 0), "refreshed": util.ToInt(item["refreshed"], 0), "failed": util.ToInt(item["failed"], 0), "errors": anyList(item["errors"])}
+	if persistenceError := util.Clean(item["persistence_error"]); persistenceError != "" {
+		result["persistence_error"] = persistenceError
+	}
+	return result
 }
 
 func newImportJob(total int) map[string]any {

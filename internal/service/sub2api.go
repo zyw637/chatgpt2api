@@ -19,6 +19,7 @@ type Sub2APIConfig struct {
 	store   storage.JSONDocumentBackend
 	servers []map[string]any
 	docName string
+	initErr error
 }
 
 type Sub2APIService struct {
@@ -35,9 +36,11 @@ type cachedJWT struct {
 
 func NewSub2APIConfig(backend ...storage.Backend) *Sub2APIConfig {
 	c := &Sub2APIConfig{store: firstJSONDocumentStore(backend), docName: "sub2api_config.json"}
-	c.servers = c.load()
+	c.servers, c.initErr = c.load()
 	return c
 }
+
+func (c *Sub2APIConfig) InitializationError() error { return c.initErr }
 
 func NewSub2APIService(config *Sub2APIConfig, accounts *AccountService) *Sub2APIService {
 	return &Sub2APIService{config: config, accounts: accounts, cache: map[string]cachedJWT{}}
@@ -60,32 +63,40 @@ func (c *Sub2APIConfig) GetServer(id string) map[string]any {
 	return nil
 }
 
-func (c *Sub2APIConfig) AddServer(name, baseURL, email, password, apiKey, groupID string) map[string]any {
+func (c *Sub2APIConfig) AddServer(name, baseURL, email, password, apiKey, groupID string) (map[string]any, error) {
 	server := normalizeSub2Server(map[string]any{"id": util.NewHex(12), "name": name, "base_url": baseURL, "email": email, "password": password, "api_key": apiKey, "group_id": groupID})
 	c.mu.Lock()
+	defer c.mu.Unlock()
 	c.servers = append(c.servers, server)
-	_ = c.saveLocked()
-	c.mu.Unlock()
-	return util.CopyMap(server)
+	if err := c.saveLocked(); err != nil {
+		c.servers = c.servers[:len(c.servers)-1]
+		return nil, err
+	}
+	return util.CopyMap(server), nil
 }
 
-func (c *Sub2APIConfig) UpdateServer(id string, updates map[string]any) map[string]any {
+func (c *Sub2APIConfig) UpdateServer(id string, updates map[string]any) (map[string]any, error) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	for index, server := range c.servers {
 		if server["id"] != id {
 			continue
 		}
-		c.servers[index] = normalizeSub2Server(mergeMaps(server, updates, map[string]any{"id": id}))
-		_ = c.saveLocked()
-		return util.CopyMap(c.servers[index])
+		next := normalizeSub2Server(mergeMaps(server, updates, map[string]any{"id": id}))
+		c.servers[index] = next
+		if err := c.saveLocked(); err != nil {
+			c.servers[index] = server
+			return nil, err
+		}
+		return util.CopyMap(next), nil
 	}
-	return nil
+	return nil, nil
 }
 
-func (c *Sub2APIConfig) DeleteServer(id string) bool {
+func (c *Sub2APIConfig) DeleteServer(id string) (bool, error) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
+	previous := append([]map[string]any(nil), c.servers...)
 	next := c.servers[:0]
 	removed := false
 	for _, server := range c.servers {
@@ -97,12 +108,15 @@ func (c *Sub2APIConfig) DeleteServer(id string) bool {
 	}
 	if removed {
 		c.servers = next
-		_ = c.saveLocked()
+		if err := c.saveLocked(); err != nil {
+			c.servers = previous
+			return false, err
+		}
 	}
-	return removed
+	return removed, nil
 }
 
-func (c *Sub2APIConfig) SetImportJob(id string, job map[string]any) map[string]any {
+func (c *Sub2APIConfig) SetImportJob(id string, job map[string]any) (map[string]any, error) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	for index, server := range c.servers {
@@ -112,10 +126,26 @@ func (c *Sub2APIConfig) SetImportJob(id string, job map[string]any) map[string]a
 		next := util.CopyMap(server)
 		next["import_job"] = normalizeImportJob(job, false)
 		c.servers[index] = next
-		_ = c.saveLocked()
-		return util.CopyMap(next)
+		if err := c.saveLocked(); err != nil {
+			c.servers[index] = server
+			return nil, err
+		}
+		return util.CopyMap(next), nil
 	}
-	return nil
+	return nil, nil
+}
+
+func (c *Sub2APIConfig) setImportJobMemory(id string, job map[string]any) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	for index, server := range c.servers {
+		if server["id"] == id {
+			next := util.CopyMap(server)
+			next["import_job"] = normalizeImportJob(job, false)
+			c.servers[index] = next
+			return
+		}
+	}
 }
 
 func (c *Sub2APIConfig) GetImportJob(id string) map[string]any {
@@ -131,13 +161,20 @@ func (c *Sub2APIConfig) GetImportJob(id string) map[string]any {
 	return nil
 }
 
-func (c *Sub2APIConfig) load() []map[string]any {
-	raw := util.AsMapSlice(loadStoredJSON(c.store, c.docName))
+func (c *Sub2APIConfig) load() ([]map[string]any, error) {
+	if c.store == nil {
+		return nil, fmt.Errorf("Sub2API document backend is required")
+	}
+	stored, err := c.store.LoadJSONDocument(c.docName)
+	if err != nil {
+		return nil, err
+	}
+	raw := util.AsMapSlice(stored)
 	out := make([]map[string]any, 0, len(raw))
 	for _, item := range raw {
 		out = append(out, normalizeSub2Server(item))
 	}
-	return out
+	return out, nil
 }
 
 func (c *Sub2APIConfig) saveLocked() error {
@@ -229,7 +266,10 @@ func (s *Sub2APIService) StartImport(server map[string]any, accountIDs []string)
 	}
 	serverID := util.Clean(server["id"])
 	job := newImportJob(len(ids))
-	saved := s.config.SetImportJob(serverID, job)
+	saved, err := s.config.SetImportJob(serverID, job)
+	if err != nil {
+		return nil, ImportJobPersistenceError{Target: "Sub2API server", Err: err}
+	}
 	if saved == nil {
 		return nil, fmt.Errorf("server not found")
 	}
@@ -238,7 +278,9 @@ func (s *Sub2APIService) StartImport(server map[string]any, accountIDs []string)
 }
 
 func (s *Sub2APIService) runImport(serverID string, server map[string]any, ids []string) {
-	s.updateJob(serverID, map[string]any{"status": "running"})
+	if err := s.updateJob(serverID, map[string]any{"status": "running"}); err != nil {
+		return
+	}
 	type result struct{ token, id, err string }
 	results := make(chan result, len(ids))
 	workers := minInt(8, maxInt(1, len(ids)))
@@ -271,20 +313,32 @@ func (s *Sub2APIService) runImport(serverID string, server map[string]any, ids [
 		if res.token != "" {
 			tokens = append(tokens, res.token)
 		} else {
-			s.appendJobError(serverID, res.id, res.err)
+			if err := s.appendJobError(serverID, res.id, res.err); err != nil {
+				return
+			}
 		}
 		current := s.config.GetImportJob(serverID)
-		s.updateJob(serverID, map[string]any{"completed": util.ToInt(current["completed"], 0) + 1, "failed": len(anyList(current["errors"]))})
+		if err := s.updateJob(serverID, map[string]any{"completed": util.ToInt(current["completed"], 0) + 1, "failed": len(anyList(current["errors"]))}); err != nil {
+			return
+		}
 	}
 	if len(tokens) == 0 {
 		current := s.config.GetImportJob(serverID)
-		s.updateJob(serverID, map[string]any{"status": "failed", "completed": util.ToInt(current["total"], 0), "failed": len(anyList(current["errors"]))})
+		_ = s.updateJob(serverID, map[string]any{"status": "failed", "completed": util.ToInt(current["total"], 0), "failed": len(anyList(current["errors"]))})
 		return
 	}
-	add := s.accounts.AddAccounts(tokens)
+	add, err := s.accounts.AddAccounts(tokens)
+	if err != nil {
+		if jobErr := s.appendJobError(serverID, "account persistence", err.Error()); jobErr != nil {
+			return
+		}
+		current := s.config.GetImportJob(serverID)
+		_ = s.updateJob(serverID, map[string]any{"status": "failed", "completed": len(ids), "failed": len(anyList(current["errors"]))})
+		return
+	}
 	refresh := s.accounts.RefreshAccounts(context.Background(), tokens)
 	current := s.config.GetImportJob(serverID)
-	s.updateJob(serverID, map[string]any{"status": "completed", "completed": len(ids), "added": util.ToInt(add["added"], 0), "skipped": util.ToInt(add["skipped"], 0), "refreshed": util.ToInt(refresh["refreshed"], 0), "failed": len(anyList(current["errors"]))})
+	_ = s.updateJob(serverID, map[string]any{"status": "completed", "completed": len(ids), "added": util.ToInt(add["added"], 0), "skipped": util.ToInt(add["skipped"], 0), "refreshed": util.ToInt(refresh["refreshed"], 0), "failed": len(anyList(current["errors"]))})
 }
 
 func (s *Sub2APIService) fetchAccessTokenForAccount(ctx context.Context, server map[string]any, accountID string) (string, error) {
@@ -429,26 +483,32 @@ func (s *Sub2APIService) getJSONWithStatus(ctx context.Context, url string, head
 	return payload, resp.StatusCode, nil
 }
 
-func (s *Sub2APIService) updateJob(serverID string, updates map[string]any) {
+func (s *Sub2APIService) updateJob(serverID string, updates map[string]any) error {
 	current := s.config.GetImportJob(serverID)
 	if current == nil {
-		return
+		return fmt.Errorf("Sub2API server not found")
 	}
 	for key, value := range updates {
 		current[key] = value
 	}
 	current["updated_at"] = util.NowISO()
-	s.config.SetImportJob(serverID, current)
+	if _, err := s.config.SetImportJob(serverID, current); err != nil {
+		current["status"] = "failed"
+		current["persistence_error"] = err.Error()
+		s.config.setImportJobMemory(serverID, current)
+		return ImportJobPersistenceError{Target: "Sub2API server", Err: err}
+	}
+	return nil
 }
 
-func (s *Sub2APIService) appendJobError(serverID, name, message string) {
+func (s *Sub2APIService) appendJobError(serverID, name, message string) error {
 	current := s.config.GetImportJob(serverID)
 	if current == nil {
-		return
+		return fmt.Errorf("Sub2API server not found")
 	}
 	errors := anyList(current["errors"])
 	errors = append(errors, map[string]any{"name": name, "error": message})
-	s.updateJob(serverID, map[string]any{"errors": errors, "failed": len(errors)})
+	return s.updateJob(serverID, map[string]any{"errors": errors, "failed": len(errors)})
 }
 
 func normalizeSub2Server(raw map[string]any) map[string]any {

@@ -7,7 +7,6 @@ import (
 	"sort"
 	"strconv"
 	"strings"
-	"time"
 
 	"chatgpt2api/internal/protocol"
 	"chatgpt2api/internal/service"
@@ -34,10 +33,13 @@ func (a *App) handleUserKeys(w http.ResponseWriter, r *http.Request) {
 			}
 			util.WriteJSON(w, http.StatusOK, map[string]any{"items": items})
 		case http.MethodPost:
-			body, _ := readJSONMap(r)
+			body, err := readJSONMap(r)
+			if err != nil {
+				writeRequestBodyError(w, err, "invalid json body")
+				return
+			}
 			var item map[string]any
 			var raw string
-			var err error
 			if identity.Role == service.AuthRoleAdmin {
 				item, raw, err = a.auth.CreateAPIKey(service.AuthRoleUser, util.Clean(body["name"]), owner)
 			} else {
@@ -78,7 +80,11 @@ func (a *App) handleUserKeys(w http.ResponseWriter, r *http.Request) {
 	}
 	switch r.Method {
 	case http.MethodPost:
-		body, _ := readJSONMap(r)
+		body, err := readJSONMap(r)
+		if err != nil {
+			writeRequestBodyError(w, err, "invalid json body")
+			return
+		}
 		updates := map[string]any{}
 		if value, ok := body["name"]; ok {
 			updates["name"] = value
@@ -90,14 +96,23 @@ func (a *App) handleUserKeys(w http.ResponseWriter, r *http.Request) {
 			util.WriteError(w, http.StatusBadRequest, "no updates provided")
 			return
 		}
-		item := a.auth.UpdateKey(keyID, updates, filter)
+		item, err := a.auth.UpdateKey(keyID, updates, filter)
+		if err != nil {
+			util.WriteError(w, http.StatusInternalServerError, "failed to save user key")
+			return
+		}
 		if item == nil {
 			util.WriteError(w, http.StatusNotFound, "user key not found")
 			return
 		}
 		util.WriteJSON(w, http.StatusOK, map[string]any{"item": item, "items": a.auth.ListKeys(filter)})
 	case http.MethodDelete:
-		if !a.auth.DeleteKey(keyID, filter) {
+		removed, err := a.auth.DeleteKey(keyID, filter)
+		if err != nil {
+			util.WriteError(w, http.StatusInternalServerError, "failed to delete user key")
+			return
+		}
+		if !removed {
 			util.WriteError(w, http.StatusNotFound, "user key not found")
 			return
 		}
@@ -126,11 +141,11 @@ func (a *App) handleProfile(w http.ResponseWriter, r *http.Request) {
 	}
 	switch r.Method {
 	case http.MethodGet:
-		a.writeLoginResponse(w, identity, "")
+		a.writeLoginResponse(w, identity)
 	case http.MethodPost:
 		body, err := readJSONMap(r)
 		if err != nil {
-			util.WriteError(w, http.StatusBadRequest, "invalid json body")
+			writeRequestBodyError(w, err, "invalid json body")
 			return
 		}
 		updated, err := a.auth.UpdateProfileName(identity, util.Clean(body["name"]))
@@ -138,7 +153,7 @@ func (a *App) handleProfile(w http.ResponseWriter, r *http.Request) {
 			util.WriteError(w, http.StatusBadRequest, err.Error())
 			return
 		}
-		a.writeLoginResponse(w, *updated, "")
+		a.writeLoginResponse(w, *updated)
 	default:
 		w.WriteHeader(http.StatusMethodNotAllowed)
 	}
@@ -151,14 +166,16 @@ func (a *App) handleProfilePassword(w http.ResponseWriter, r *http.Request) {
 	}
 	body, err := readJSONMap(r)
 	if err != nil {
-		util.WriteError(w, http.StatusBadRequest, "invalid json body")
+		writeRequestBodyError(w, err, "invalid json body")
 		return
 	}
-	if err := a.auth.ChangeProfilePassword(identity, util.Clean(body["current_password"]), util.Clean(body["new_password"])); err != nil {
+	updated, token, err := a.auth.ChangeProfilePassword(identity, util.Clean(body["current_password"]), util.Clean(body["new_password"]))
+	if err != nil {
 		util.WriteError(w, http.StatusBadRequest, err.Error())
 		return
 	}
-	util.WriteJSON(w, http.StatusOK, map[string]any{"ok": true})
+	setAuthSessionCookie(w, r, token)
+	a.writeLoginResponse(w, *updated)
 }
 
 func (a *App) handleProfileAPIKey(w http.ResponseWriter, r *http.Request) {
@@ -177,7 +194,11 @@ func (a *App) handleProfileAPIKey(w http.ResponseWriter, r *http.Request) {
 		case http.MethodGet:
 			util.WriteJSON(w, http.StatusOK, map[string]any{"items": a.auth.ListPersonalAPIKey(identity)})
 		case http.MethodPost:
-			body, _ := readJSONMap(r)
+			body, err := readJSONMap(r)
+			if err != nil {
+				writeRequestBodyError(w, err, "invalid json body")
+				return
+			}
 			item, raw, err := a.auth.UpsertPersonalAPIKey(identity, util.Clean(body["name"]))
 			if err != nil {
 				util.WriteError(w, http.StatusBadRequest, err.Error())
@@ -215,7 +236,11 @@ func (a *App) handleProfileAPIKey(w http.ResponseWriter, r *http.Request) {
 	}
 	switch r.Method {
 	case http.MethodPost:
-		body, _ := readJSONMap(r)
+		body, err := readJSONMap(r)
+		if err != nil {
+			writeRequestBodyError(w, err, "invalid json body")
+			return
+		}
 		updates := map[string]any{}
 		if value, ok := body["name"]; ok {
 			updates["name"] = value
@@ -227,14 +252,23 @@ func (a *App) handleProfileAPIKey(w http.ResponseWriter, r *http.Request) {
 			util.WriteError(w, http.StatusBadRequest, "no updates provided")
 			return
 		}
-		item := a.auth.UpdateKey(keyID, updates, filter)
+		item, err := a.auth.UpdateKey(keyID, updates, filter)
+		if err != nil {
+			util.WriteError(w, http.StatusInternalServerError, "failed to save profile API key")
+			return
+		}
 		if item == nil {
 			util.WriteError(w, http.StatusNotFound, "profile API key not found")
 			return
 		}
 		util.WriteJSON(w, http.StatusOK, map[string]any{"item": item, "items": a.auth.ListPersonalAPIKey(identity)})
 	case http.MethodDelete:
-		if !a.auth.DeleteKey(keyID, filter) {
+		removed, err := a.auth.DeleteKey(keyID, filter)
+		if err != nil {
+			util.WriteError(w, http.StatusInternalServerError, "failed to delete profile API key")
+			return
+		}
+		if !removed {
 			util.WriteError(w, http.StatusNotFound, "profile API key not found")
 			return
 		}
@@ -271,11 +305,16 @@ func (a *App) handleProfilePromptFavorites(w http.ResponseWriter, r *http.Reques
 	if r.URL.Path == base {
 		switch r.Method {
 		case http.MethodGet:
-			util.WriteJSON(w, http.StatusOK, map[string]any{"items": a.prompts.List(ownerID)})
+			items, err := a.prompts.List(ownerID)
+			if err != nil {
+				util.WriteError(w, http.StatusInternalServerError, "failed to load prompt favorites")
+				return
+			}
+			util.WriteJSON(w, http.StatusOK, map[string]any{"items": items})
 		case http.MethodPost:
 			body, err := readJSONMap(r)
 			if err != nil {
-				util.WriteError(w, http.StatusBadRequest, "invalid json body")
+				writeRequestBodyError(w, err, "invalid json body")
 				return
 			}
 			item, err := a.prompts.Upsert(ownerID, body)
@@ -283,7 +322,12 @@ func (a *App) handleProfilePromptFavorites(w http.ResponseWriter, r *http.Reques
 				util.WriteError(w, http.StatusBadRequest, err.Error())
 				return
 			}
-			util.WriteJSON(w, http.StatusOK, map[string]any{"item": item, "items": a.prompts.List(ownerID)})
+			items, err := a.prompts.List(ownerID)
+			if err != nil {
+				util.WriteError(w, http.StatusInternalServerError, "failed to load prompt favorites")
+				return
+			}
+			util.WriteJSON(w, http.StatusOK, map[string]any{"item": item, "items": items})
 		default:
 			w.WriteHeader(http.StatusMethodNotAllowed)
 		}
@@ -299,11 +343,21 @@ func (a *App) handleProfilePromptFavorites(w http.ResponseWriter, r *http.Reques
 		w.WriteHeader(http.StatusMethodNotAllowed)
 		return
 	}
-	if !a.prompts.Delete(ownerID, parts[3]) {
+	deleted, err := a.prompts.Delete(ownerID, parts[3])
+	if err != nil {
+		util.WriteError(w, http.StatusInternalServerError, "failed to persist prompt favorite")
+		return
+	}
+	if !deleted {
 		util.WriteError(w, http.StatusNotFound, "prompt favorite not found")
 		return
 	}
-	util.WriteJSON(w, http.StatusOK, map[string]any{"items": a.prompts.List(ownerID)})
+	items, err := a.prompts.List(ownerID)
+	if err != nil {
+		util.WriteError(w, http.StatusInternalServerError, "failed to load prompt favorites")
+		return
+	}
+	util.WriteJSON(w, http.StatusOK, map[string]any{"items": items})
 }
 
 func (a *App) handleAdminRoles(w http.ResponseWriter, r *http.Request) {
@@ -316,7 +370,11 @@ func (a *App) handleAdminRoles(w http.ResponseWriter, r *http.Request) {
 		case http.MethodGet:
 			util.WriteJSON(w, http.StatusOK, map[string]any{"items": a.auth.ListRoles()})
 		case http.MethodPost:
-			body, _ := readJSONMap(r)
+			body, err := readJSONMap(r)
+			if err != nil {
+				writeRequestBodyError(w, err, "invalid json body")
+				return
+			}
 			item, err := a.auth.CreateRole(body)
 			if err != nil {
 				util.WriteError(w, http.StatusBadRequest, err.Error())
@@ -337,7 +395,11 @@ func (a *App) handleAdminRoles(w http.ResponseWriter, r *http.Request) {
 	roleID := parts[3]
 	switch r.Method {
 	case http.MethodPost:
-		body, _ := readJSONMap(r)
+		body, err := readJSONMap(r)
+		if err != nil {
+			writeRequestBodyError(w, err, "invalid json body")
+			return
+		}
 		item, err := a.auth.UpdateRole(roleID, body)
 		if err != nil {
 			status := http.StatusBadRequest
@@ -386,7 +448,7 @@ func (a *App) handleAdminUsers(w http.ResponseWriter, r *http.Request) {
 		case http.MethodPost:
 			body, err := readJSONMap(r)
 			if err != nil {
-				util.WriteError(w, http.StatusBadRequest, "invalid json body")
+				writeRequestBodyError(w, err, "invalid json body")
 				return
 			}
 			enabled := true
@@ -432,7 +494,7 @@ func (a *App) handleAdminUsers(w http.ResponseWriter, r *http.Request) {
 		}
 		body, err := readJSONMap(r)
 		if err != nil {
-			util.WriteError(w, http.StatusBadRequest, "invalid json body")
+			writeRequestBodyError(w, err, "invalid json body")
 			return
 		}
 		targets, err := a.bulkBillingTargetUserIDs(body)
@@ -487,7 +549,11 @@ func (a *App) handleAdminUsers(w http.ResponseWriter, r *http.Request) {
 			w.WriteHeader(http.StatusMethodNotAllowed)
 			return
 		}
-		body, _ := readJSONMap(r)
+		body, err := readJSONMap(r)
+		if err != nil {
+			writeRequestBodyError(w, err, "invalid json body")
+			return
+		}
 		user := findManagedUser(a.auth.ListUsers(), userID)
 		if user == nil {
 			util.WriteError(w, http.StatusNotFound, "user not found")
@@ -531,7 +597,7 @@ func (a *App) handleAdminUsers(w http.ResponseWriter, r *http.Request) {
 		case http.MethodPost:
 			body, err := readJSONMap(r)
 			if err != nil {
-				util.WriteError(w, http.StatusBadRequest, "invalid json body")
+				writeRequestBodyError(w, err, "invalid json body")
 				return
 			}
 			if findManagedUser(a.auth.ListUsers(), userID) == nil {
@@ -573,7 +639,11 @@ func (a *App) handleAdminUsers(w http.ResponseWriter, r *http.Request) {
 		item["billing_adjustments"] = a.billing.ListAdjustments(userID, 10)
 		util.WriteJSON(w, http.StatusOK, map[string]any{"item": item})
 	case http.MethodPost:
-		body, _ := readJSONMap(r)
+		body, err := readJSONMap(r)
+		if err != nil {
+			writeRequestBodyError(w, err, "invalid json body")
+			return
+		}
 		updates := map[string]any{}
 		if value, ok := body["name"]; ok {
 			updates["name"] = value
@@ -594,7 +664,12 @@ func (a *App) handleAdminUsers(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		if len(updates) > 0 {
-			if item := a.auth.UpdateUser(userID, updates); item == nil {
+			item, err := a.auth.UpdateUser(userID, updates)
+			if err != nil {
+				util.WriteError(w, http.StatusInternalServerError, "failed to save user")
+				return
+			}
+			if item == nil {
 				util.WriteError(w, http.StatusNotFound, "user not found")
 				return
 			}
@@ -617,7 +692,12 @@ func (a *App) handleAdminUsers(w http.ResponseWriter, r *http.Request) {
 		response["item"] = item
 		util.WriteJSON(w, http.StatusOK, response)
 	case http.MethodDelete:
-		if !a.auth.DeleteUser(userID) {
+		removed, err := a.auth.DeleteUser(userID)
+		if err != nil {
+			util.WriteError(w, http.StatusInternalServerError, "failed to delete user")
+			return
+		}
+		if !removed {
 			util.WriteError(w, http.StatusNotFound, "user not found")
 			return
 		}
@@ -847,23 +927,36 @@ func bulkBillingAdjustmentSummary(results []service.BillingBulkAdjustmentResult)
 	}
 }
 
+var managedUserSortKeys = map[string]struct{}{
+	"id": {}, "name": {}, "username": {}, "provider": {}, "enabled": {}, "role_id": {}, "role_name": {},
+	"billing_available": {}, "call_count": {}, "quota_used": {}, "failure_count": {},
+	"created_at": {}, "last_used_at": {}, "updated_at": {},
+}
+
 func parseManagedUsersQuery(r *http.Request) (managedUsersQuery, error) {
 	values := r.URL.Query()
-	page, err := parseManagedUsersPage(values.Get("page"))
+	page, err := parsePositiveIntParam(values.Get("page"), 1, "page")
 	if err != nil {
 		return managedUsersQuery{}, err
 	}
-	pageSize, err := parseManagedUsersPageSize(values.Get("page_size"))
+	pageSize, err := parsePositiveIntParam(values.Get("page_size"), 20, "page_size")
 	if err != nil {
 		return managedUsersQuery{}, err
 	}
-	sortBy, err := parseManagedUsersSortBy(values.Get("sort_by"))
-	if err != nil {
-		return managedUsersQuery{}, err
+	if pageSize > 100 {
+		pageSize = 100
 	}
-	sortOrder, err := parseManagedUsersSortOrder(values.Get("sort_order"))
-	if err != nil {
-		return managedUsersQuery{}, err
+	sortBy := strings.TrimSpace(values.Get("sort_by"))
+	if sortBy == "" {
+		sortBy = "created_at"
+	} else if _, ok := managedUserSortKeys[sortBy]; !ok {
+		return managedUsersQuery{}, fmt.Errorf("sort_by 参数无效")
+	}
+	sortOrder := strings.ToLower(strings.TrimSpace(values.Get("sort_order")))
+	if sortOrder == "" {
+		sortOrder = "desc"
+	} else if sortOrder != "asc" && sortOrder != "desc" {
+		return managedUsersQuery{}, fmt.Errorf("sort_order 参数无效")
 	}
 	return managedUsersQuery{
 		Page:      page,
@@ -876,38 +969,16 @@ func parseManagedUsersQuery(r *http.Request) (managedUsersQuery, error) {
 	}, nil
 }
 
-func parseManagedUsersPage(raw string) (int, error) {
+func parsePositiveIntParam(raw string, defaultValue int, name string) (int, error) {
 	raw = strings.TrimSpace(raw)
 	if raw == "" {
-		return 1, nil
+		return defaultValue, nil
 	}
 	value, err := strconv.Atoi(raw)
 	if err != nil || value < 1 {
-		return 0, fmt.Errorf("page 参数无效")
+		return 0, fmt.Errorf("%s 参数无效", name)
 	}
 	return value, nil
-}
-
-func parseManagedUsersPageSize(raw string) (int, error) {
-	raw = strings.TrimSpace(raw)
-	if raw == "" {
-		return 20, nil
-	}
-	value, err := strconv.Atoi(raw)
-	if err != nil || value < 1 {
-		return 0, fmt.Errorf("page_size 参数无效")
-	}
-	return normalizedManagedUsersPageSize(value), nil
-}
-
-func normalizedManagedUsersPageSize(value int) int {
-	if value <= 0 {
-		return 20
-	}
-	if value > 100 {
-		return 100
-	}
-	return value
 }
 
 func managedUsersTotalPages(total, pageSize int) int {
@@ -918,32 +989,6 @@ func managedUsersTotalPages(total, pageSize int) int {
 		return 1
 	}
 	return (total + pageSize - 1) / pageSize
-}
-
-func parseManagedUsersSortBy(raw string) (string, error) {
-	value := strings.TrimSpace(raw)
-	if value == "" {
-		return "created_at", nil
-	}
-	switch value {
-	case "id", "name", "username", "provider", "enabled", "role_id", "role_name", "billing_available", "call_count", "quota_used", "failure_count", "created_at", "last_used_at", "updated_at":
-		return value, nil
-	default:
-		return "", fmt.Errorf("sort_by 参数无效")
-	}
-}
-
-func parseManagedUsersSortOrder(raw string) (string, error) {
-	value := strings.ToLower(strings.TrimSpace(raw))
-	if value == "" {
-		return "desc", nil
-	}
-	switch value {
-	case "asc", "desc":
-		return value, nil
-	default:
-		return "", fmt.Errorf("sort_order 参数无效")
-	}
 }
 
 func filterManagedUsers(items []map[string]any, query managedUsersQuery) []map[string]any {
@@ -984,61 +1029,34 @@ func sortManagedUsers(items []map[string]any, query managedUsersQuery) {
 }
 
 func compareManagedUsers(left, right map[string]any, sortBy string) int {
+	numeric := func(item map[string]any) int {
+		switch sortBy {
+		case "enabled":
+			if util.ToBool(item["enabled"]) {
+				return 1
+			}
+			return 0
+		case "billing_available":
+			return util.ToInt(util.StringMap(item["billing"])["available"], 0)
+		default:
+			return util.ToInt(item[sortBy], 0)
+		}
+	}
 	switch sortBy {
-	case "enabled":
-		return compareManagedUserInts(managedUserSortBool(left, sortBy), managedUserSortBool(right, sortBy))
-	case "billing_available", "call_count", "quota_used", "failure_count":
-		return compareManagedUserInts(managedUserSortInt(left, sortBy), managedUserSortInt(right, sortBy))
+	case "enabled", "billing_available", "call_count", "quota_used", "failure_count":
+		leftValue, rightValue := numeric(left), numeric(right)
+		switch {
+		case leftValue < rightValue:
+			return -1
+		case leftValue > rightValue:
+			return 1
+		default:
+			return 0
+		}
+	case "name", "username", "provider", "role_id", "role_name", "created_at", "last_used_at", "updated_at":
+		return strings.Compare(strings.ToLower(util.Clean(left[sortBy])), strings.ToLower(util.Clean(right[sortBy])))
 	default:
-		return strings.Compare(strings.ToLower(managedUserSortString(left, sortBy)), strings.ToLower(managedUserSortString(right, sortBy)))
-	}
-}
-
-func managedUserSortString(item map[string]any, sortBy string) string {
-	switch sortBy {
-	case "name":
-		return util.Clean(item["name"])
-	case "username":
-		return util.Clean(item["username"])
-	case "provider":
-		return util.Clean(item["provider"])
-	case "role_id":
-		return util.Clean(item["role_id"])
-	case "role_name":
-		return util.Clean(item["role_name"])
-	case "created_at":
-		return util.Clean(item["created_at"])
-	case "last_used_at":
-		return util.Clean(item["last_used_at"])
-	case "updated_at":
-		return util.Clean(item["updated_at"])
-	default:
-		return util.Clean(item["id"])
-	}
-}
-
-func managedUserSortBool(item map[string]any, sortBy string) int {
-	if sortBy == "enabled" && util.ToBool(item["enabled"]) {
-		return 1
-	}
-	return 0
-}
-
-func managedUserSortInt(item map[string]any, sortBy string) int {
-	if sortBy == "billing_available" {
-		return util.ToInt(util.StringMap(item["billing"])["available"], 0)
-	}
-	return util.ToInt(item[sortBy], 0)
-}
-
-func compareManagedUserInts(left, right int) int {
-	switch {
-	case left < right:
-		return -1
-	case left > right:
-		return 1
-	default:
-		return 0
+		return strings.Compare(strings.ToLower(util.Clean(left["id"])), strings.ToLower(util.Clean(right["id"])))
 	}
 }
 
@@ -1088,14 +1106,18 @@ func (a *App) handleAdminAnnouncements(w http.ResponseWriter, r *http.Request) {
 		case http.MethodPost:
 			body, err := readJSONMap(r)
 			if err != nil {
-				util.WriteError(w, http.StatusBadRequest, "invalid json body")
+				writeRequestBodyError(w, err, "invalid json body")
 				return
 			}
 			if util.Clean(body["content"]) == "" {
 				util.WriteError(w, http.StatusBadRequest, "content is required")
 				return
 			}
-			item := a.announce.Create(body)
+			item, err := a.announce.Create(body)
+			if err != nil {
+				util.WriteError(w, http.StatusInternalServerError, "failed to persist announcement")
+				return
+			}
 			util.WriteJSON(w, http.StatusOK, map[string]any{"item": item, "items": a.announce.ListAll()})
 		default:
 			w.WriteHeader(http.StatusMethodNotAllowed)
@@ -1112,21 +1134,30 @@ func (a *App) handleAdminAnnouncements(w http.ResponseWriter, r *http.Request) {
 	case http.MethodPost:
 		body, err := readJSONMap(r)
 		if err != nil {
-			util.WriteError(w, http.StatusBadRequest, "invalid json body")
+			writeRequestBodyError(w, err, "invalid json body")
 			return
 		}
 		if value, exists := body["content"]; exists && util.Clean(value) == "" {
 			util.WriteError(w, http.StatusBadRequest, "content is required")
 			return
 		}
-		item := a.announce.Update(id, body)
+		item, err := a.announce.Update(id, body)
+		if err != nil {
+			util.WriteError(w, http.StatusInternalServerError, "failed to persist announcement")
+			return
+		}
 		if item == nil {
 			util.WriteError(w, http.StatusNotFound, "announcement not found")
 			return
 		}
 		util.WriteJSON(w, http.StatusOK, map[string]any{"item": item, "items": a.announce.ListAll()})
 	case http.MethodDelete:
-		if !a.announce.Delete(id) {
+		deleted, err := a.announce.Delete(id)
+		if err != nil {
+			util.WriteError(w, http.StatusInternalServerError, "failed to persist announcement")
+			return
+		}
+		if !deleted {
 			util.WriteError(w, http.StatusNotFound, "announcement not found")
 			return
 		}
@@ -1149,7 +1180,7 @@ func (a *App) handleAccounts(w http.ResponseWriter, r *http.Request) {
 	case r.URL.Path == "/api/accounts/session" && r.Method == http.MethodPost:
 		body, err := readJSONMap(r)
 		if err != nil {
-			util.WriteError(w, http.StatusBadRequest, "invalid json body")
+			writeRequestBodyError(w, err, "invalid json body")
 			return
 		}
 		sessionJSON := util.Clean(body["session_json"])
@@ -1166,13 +1197,21 @@ func (a *App) handleAccounts(w http.ResponseWriter, r *http.Request) {
 		a.redactAccountPayloadForIdentity(identity, result)
 		util.WriteJSON(w, http.StatusOK, result)
 	case r.URL.Path == "/api/accounts" && r.Method == http.MethodPost:
-		body, _ := readJSONMap(r)
+		body, err := readJSONMap(r)
+		if err != nil {
+			writeRequestBodyError(w, err, "invalid json body")
+			return
+		}
 		tokens := util.AsStringSlice(body["tokens"])
 		if len(tokens) == 0 {
 			util.WriteError(w, http.StatusBadRequest, "tokens is required")
 			return
 		}
-		result := a.accounts.AddAccounts(tokens)
+		result, err := a.accounts.AddAccounts(tokens)
+		if err != nil {
+			util.WriteError(w, http.StatusInternalServerError, "failed to save accounts")
+			return
+		}
 		refresh := a.accounts.RefreshAccounts(r.Context(), tokens)
 		for key, value := range refresh {
 			if key == "refreshed" || key == "errors" || key == "items" {
@@ -1182,7 +1221,11 @@ func (a *App) handleAccounts(w http.ResponseWriter, r *http.Request) {
 		a.redactAccountPayloadForIdentity(identity, result)
 		util.WriteJSON(w, http.StatusOK, result)
 	case r.URL.Path == "/api/accounts" && r.Method == http.MethodDelete:
-		body, _ := readJSONMap(r)
+		body, err := readJSONMap(r)
+		if err != nil {
+			writeRequestBodyError(w, err, "invalid json body")
+			return
+		}
 		tokens := util.AsStringSlice(body["tokens"])
 		accountIDs := util.AsStringSlice(body["account_ids"])
 		if len(tokens) == 0 {
@@ -1196,11 +1239,19 @@ func (a *App) handleAccounts(w http.ResponseWriter, r *http.Request) {
 			util.WriteError(w, http.StatusBadRequest, "tokens or account_ids is required")
 			return
 		}
-		result := a.accounts.DeleteAccounts(tokens)
+		result, err := a.accounts.DeleteAccounts(tokens)
+		if err != nil {
+			util.WriteError(w, http.StatusInternalServerError, "failed to save accounts")
+			return
+		}
 		a.redactAccountPayloadForIdentity(identity, result)
 		util.WriteJSON(w, http.StatusOK, result)
 	case r.URL.Path == "/api/accounts/refresh" && r.Method == http.MethodPost:
-		body, _ := readJSONMap(r)
+		body, err := readJSONMap(r)
+		if err != nil {
+			writeRequestBodyError(w, err, "invalid json body")
+			return
+		}
 		tokens := util.AsStringSlice(body["access_tokens"])
 		accountIDs := util.AsStringSlice(body["account_ids"])
 		if len(tokens) == 0 && len(accountIDs) > 0 {
@@ -1223,7 +1274,7 @@ func (a *App) handleAccounts(w http.ResponseWriter, r *http.Request) {
 	case r.URL.Path == "/api/accounts/upstream-actions" && r.Method == http.MethodPost:
 		body, err := readJSONMap(r)
 		if err != nil {
-			util.WriteError(w, http.StatusBadRequest, "invalid json body")
+			writeRequestBodyError(w, err, "invalid json body")
 			return
 		}
 		tokens := util.AsStringSlice(body["access_tokens"])
@@ -1255,7 +1306,7 @@ func (a *App) handleAccounts(w http.ResponseWriter, r *http.Request) {
 	case r.URL.Path == "/api/accounts/toggle-enabled" && r.Method == http.MethodPost:
 		body, err := readJSONMap(r)
 		if err != nil {
-			util.WriteError(w, http.StatusBadRequest, "invalid json body")
+			writeRequestBodyError(w, err, "invalid json body")
 			return
 		}
 		accountIDs := util.AsStringSlice(body["account_ids"])
@@ -1271,11 +1322,19 @@ func (a *App) handleAccounts(w http.ResponseWriter, r *http.Request) {
 			util.WriteError(w, http.StatusBadRequest, "enabled is required")
 			return
 		}
-		result := a.accounts.SetAccountsEnabledByIDs(accountIDs, util.ToBool(enabledRaw))
+		result, err := a.accounts.SetAccountsEnabledByIDs(accountIDs, util.ToBool(enabledRaw))
+		if err != nil {
+			util.WriteError(w, http.StatusInternalServerError, "failed to save accounts")
+			return
+		}
 		a.redactAccountPayloadForIdentity(identity, result)
 		util.WriteJSON(w, http.StatusOK, result)
 	case r.URL.Path == "/api/accounts/update" && r.Method == http.MethodPost:
-		body, _ := readJSONMap(r)
+		body, err := readJSONMap(r)
+		if err != nil {
+			writeRequestBodyError(w, err, "invalid json body")
+			return
+		}
 		token := util.Clean(body["access_token"])
 		accountID := util.Clean(body["account_id"])
 		if token == "" && accountID != "" {
@@ -1299,7 +1358,11 @@ func (a *App) handleAccounts(w http.ResponseWriter, r *http.Request) {
 			util.WriteError(w, http.StatusBadRequest, "no updates provided")
 			return
 		}
-		item := a.accounts.UpdateAccount(token, updates)
+		item, err := a.accounts.UpdateAccount(token, updates)
+		if err != nil {
+			util.WriteError(w, http.StatusInternalServerError, "failed to save account")
+			return
+		}
 		if item == nil {
 			util.WriteError(w, http.StatusNotFound, "account not found")
 			return
@@ -1370,7 +1433,11 @@ func (a *App) handleCPA(w http.ResponseWriter, r *http.Request) {
 		case http.MethodGet:
 			util.WriteJSON(w, http.StatusOK, map[string]any{"pools": sanitizeCPAPools(a.cpa.ListPools())})
 		case http.MethodPost:
-			body, _ := readJSONMap(r)
+			body, err := readJSONMap(r)
+			if err != nil {
+				writeRequestBodyError(w, err, "invalid json body")
+				return
+			}
 			if util.Clean(body["base_url"]) == "" {
 				util.WriteError(w, http.StatusBadRequest, "base_url is required")
 				return
@@ -1379,7 +1446,11 @@ func (a *App) handleCPA(w http.ResponseWriter, r *http.Request) {
 				util.WriteError(w, http.StatusBadRequest, "secret_key is required")
 				return
 			}
-			pool := a.cpa.AddPool(util.Clean(body["name"]), util.Clean(body["base_url"]), util.Clean(body["secret_key"]))
+			pool, err := a.cpa.AddPool(util.Clean(body["name"]), util.Clean(body["base_url"]), util.Clean(body["secret_key"]))
+			if err != nil {
+				util.WriteError(w, http.StatusInternalServerError, "failed to persist CPA pool")
+				return
+			}
 			util.WriteJSON(w, http.StatusOK, map[string]any{"pool": sanitizeCPAPool(pool), "pools": sanitizeCPAPools(a.cpa.ListPools())})
 		default:
 			w.WriteHeader(http.StatusMethodNotAllowed)
@@ -1399,11 +1470,24 @@ func (a *App) handleCPA(w http.ResponseWriter, r *http.Request) {
 	if len(parts) == 4 {
 		switch r.Method {
 		case http.MethodPost:
-			body, _ := readJSONMap(r)
-			updated := a.cpa.UpdatePool(poolID, body)
+			body, err := readJSONMap(r)
+			if err != nil {
+				writeRequestBodyError(w, err, "invalid json body")
+				return
+			}
+			updated, err := a.cpa.UpdatePool(poolID, body)
+			if err != nil {
+				util.WriteError(w, http.StatusInternalServerError, "failed to persist CPA pool")
+				return
+			}
 			util.WriteJSON(w, http.StatusOK, map[string]any{"pool": sanitizeCPAPool(updated), "pools": sanitizeCPAPools(a.cpa.ListPools())})
 		case http.MethodDelete:
-			if !a.cpa.DeletePool(poolID) {
+			deleted, err := a.cpa.DeletePool(poolID)
+			if err != nil {
+				util.WriteError(w, http.StatusInternalServerError, "failed to persist CPA pool")
+				return
+			}
+			if !deleted {
 				util.WriteError(w, http.StatusNotFound, "pool not found")
 				return
 			}
@@ -1428,10 +1512,19 @@ func (a *App) handleCPA(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		if r.Method == http.MethodPost {
-			body, _ := readJSONMap(r)
+			body, err := readJSONMap(r)
+			if err != nil {
+				writeRequestBodyError(w, err, "invalid json body")
+				return
+			}
 			job, err := a.cpaImport.StartImport(pool, util.AsStringSlice(body["names"]))
 			if err != nil {
-				util.WriteError(w, http.StatusBadRequest, err.Error())
+				var persistence service.ImportJobPersistenceError
+				if errors.As(err, &persistence) {
+					util.WriteError(w, http.StatusInternalServerError, "failed to persist import job")
+				} else {
+					util.WriteError(w, http.StatusBadRequest, err.Error())
+				}
 				return
 			}
 			util.WriteJSON(w, http.StatusOK, map[string]any{"import_job": job})
@@ -1451,7 +1544,11 @@ func (a *App) handleSub2API(w http.ResponseWriter, r *http.Request) {
 		case http.MethodGet:
 			util.WriteJSON(w, http.StatusOK, map[string]any{"servers": sanitizeSub2Servers(a.sub2.ListServers())})
 		case http.MethodPost:
-			body, _ := readJSONMap(r)
+			body, err := readJSONMap(r)
+			if err != nil {
+				writeRequestBodyError(w, err, "invalid json body")
+				return
+			}
 			if util.Clean(body["base_url"]) == "" {
 				util.WriteError(w, http.StatusBadRequest, "base_url is required")
 				return
@@ -1462,7 +1559,11 @@ func (a *App) handleSub2API(w http.ResponseWriter, r *http.Request) {
 				util.WriteError(w, http.StatusBadRequest, "email+password or api_key is required")
 				return
 			}
-			server := a.sub2.AddServer(util.Clean(body["name"]), util.Clean(body["base_url"]), util.Clean(body["email"]), util.Clean(body["password"]), util.Clean(body["api_key"]), util.Clean(body["group_id"]))
+			server, err := a.sub2.AddServer(util.Clean(body["name"]), util.Clean(body["base_url"]), util.Clean(body["email"]), util.Clean(body["password"]), util.Clean(body["api_key"]), util.Clean(body["group_id"]))
+			if err != nil {
+				util.WriteError(w, http.StatusInternalServerError, "failed to persist Sub2API server")
+				return
+			}
 			util.WriteJSON(w, http.StatusOK, map[string]any{"server": sanitizeSub2Server(server), "servers": sanitizeSub2Servers(a.sub2.ListServers())})
 		default:
 			w.WriteHeader(http.StatusMethodNotAllowed)
@@ -1482,11 +1583,24 @@ func (a *App) handleSub2API(w http.ResponseWriter, r *http.Request) {
 	if len(parts) == 4 {
 		switch r.Method {
 		case http.MethodPost:
-			body, _ := readJSONMap(r)
-			updated := a.sub2.UpdateServer(serverID, body)
+			body, err := readJSONMap(r)
+			if err != nil {
+				writeRequestBodyError(w, err, "invalid json body")
+				return
+			}
+			updated, err := a.sub2.UpdateServer(serverID, body)
+			if err != nil {
+				util.WriteError(w, http.StatusInternalServerError, "failed to persist Sub2API server")
+				return
+			}
 			util.WriteJSON(w, http.StatusOK, map[string]any{"server": sanitizeSub2Server(updated), "servers": sanitizeSub2Servers(a.sub2.ListServers())})
 		case http.MethodDelete:
-			if !a.sub2.DeleteServer(serverID) {
+			deleted, err := a.sub2.DeleteServer(serverID)
+			if err != nil {
+				util.WriteError(w, http.StatusInternalServerError, "failed to persist Sub2API server")
+				return
+			}
+			if !deleted {
 				util.WriteError(w, http.StatusNotFound, "server not found")
 				return
 			}
@@ -1520,10 +1634,19 @@ func (a *App) handleSub2API(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		if r.Method == http.MethodPost {
-			body, _ := readJSONMap(r)
+			body, err := readJSONMap(r)
+			if err != nil {
+				writeRequestBodyError(w, err, "invalid json body")
+				return
+			}
 			job, err := a.sub2Import.StartImport(server, util.AsStringSlice(body["account_ids"]))
 			if err != nil {
-				util.WriteError(w, http.StatusBadRequest, err.Error())
+				var persistence service.ImportJobPersistenceError
+				if errors.As(err, &persistence) {
+					util.WriteError(w, http.StatusInternalServerError, "failed to persist import job")
+				} else {
+					util.WriteError(w, http.StatusBadRequest, err.Error())
+				}
 				return
 			}
 			util.WriteJSON(w, http.StatusOK, map[string]any{"import_job": job})
@@ -1552,6 +1675,10 @@ func (a *App) handleCreationTasks(w http.ResponseWriter, r *http.Request) {
 		}
 		task, err := a.tasks.CancelTask(identity, parts[2])
 		if err != nil {
+			if errors.Is(err, service.ErrImageTaskPersistence) {
+				util.WriteError(w, http.StatusInternalServerError, "failed to save creation task")
+				return
+			}
 			util.WriteError(w, http.StatusNotFound, err.Error())
 			return
 		}
@@ -1559,7 +1686,11 @@ func (a *App) handleCreationTasks(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	if r.URL.Path == "/api/creation-tasks/image-generations" && r.Method == http.MethodPost {
-		body, _ := readJSONMap(r)
+		body, err := readJSONMap(r)
+		if err != nil {
+			writeRequestBodyError(w, err, "invalid json body")
+			return
+		}
 		task, err := a.tasks.SubmitGenerationWithOptions(r.Context(), identity, util.Clean(body["client_task_id"]), util.Clean(body["prompt"]), firstNonEmpty(util.Clean(body["model"]), util.ImageModelAuto), util.Clean(body["size"]), util.Clean(body["quality"]), a.resolveImageBaseURL(r), util.ToInt(body["n"], 1), body["messages"], imageTaskRequestMetadata(body), imageOutputOptionsFromBody(body), imageToolOptionsFromBody(body), util.Clean(body["visibility"]))
 		if err != nil {
 			writeCreationTaskSubmitError(w, err)
@@ -1569,7 +1700,11 @@ func (a *App) handleCreationTasks(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	if r.URL.Path == "/api/creation-tasks/chat-completions" && r.Method == http.MethodPost {
-		body, _ := readJSONMap(r)
+		body, err := readJSONMap(r)
+		if err != nil {
+			writeRequestBodyError(w, err, "invalid json body")
+			return
+		}
 		task, err := a.tasks.SubmitChat(r.Context(), identity, util.Clean(body["client_task_id"]), util.Clean(body["prompt"]), firstNonEmpty(util.Clean(body["model"]), util.ImageModelAuto), body["messages"], protocol.IsImageChatRequest(body), util.ToInt(body["n"], 1))
 		if err != nil {
 			writeCreationTaskSubmitError(w, err)
@@ -1581,7 +1716,7 @@ func (a *App) handleCreationTasks(w http.ResponseWriter, r *http.Request) {
 	if r.URL.Path == "/api/creation-tasks/image-edits" && r.Method == http.MethodPost {
 		body, images, err := readMultipartImageBody(r)
 		if err != nil {
-			util.WriteError(w, http.StatusBadRequest, err.Error())
+			writeRequestBodyError(w, err, err.Error())
 			return
 		}
 		task, err := a.tasks.SubmitEditWithOptions(r.Context(), identity, util.Clean(body["client_task_id"]), util.Clean(body["prompt"]), firstNonEmpty(util.Clean(body["model"]), util.ImageModelAuto), util.Clean(body["size"]), util.Clean(body["quality"]), a.resolveImageBaseURL(r), images, util.ToInt(body["n"], 1), body["messages"], imageTaskRequestMetadata(body), imageOutputOptionsFromBody(body), imageToolOptionsFromBody(body), util.Clean(body["visibility"]))
@@ -1658,6 +1793,10 @@ func imageOutputCompressionFromBody(value any) (int, bool) {
 }
 
 func writeCreationTaskSubmitError(w http.ResponseWriter, err error) {
+	if errors.Is(err, service.ErrImageTaskPersistence) {
+		util.WriteError(w, http.StatusInternalServerError, "failed to save creation task")
+		return
+	}
 	var billingErr service.BillingLimitError
 	if errors.As(err, &billingErr) {
 		util.WriteJSON(w, http.StatusTooManyRequests, billingErr.OpenAIError())
@@ -1669,59 +1808,6 @@ func writeCreationTaskSubmitError(w http.ResponseWriter, err error) {
 		return
 	}
 	util.WriteError(w, http.StatusBadRequest, err.Error())
-}
-
-func (a *App) handleRegister(w http.ResponseWriter, r *http.Request) {
-	if r.URL.Path == "/api/register/events" {
-		token := r.URL.Query().Get("token")
-		if _, ok := a.requireIdentity(w, r, "Bearer "+token); !ok {
-			return
-		}
-		a.streamRegisterEvents(w, r)
-		return
-	}
-	if _, ok := a.requireIdentity(w, r, ""); !ok {
-		return
-	}
-	switch {
-	case r.URL.Path == "/api/register" && r.Method == http.MethodGet:
-		util.WriteJSON(w, http.StatusOK, map[string]any{"register": a.register.Get()})
-	case r.URL.Path == "/api/register" && r.Method == http.MethodPost:
-		body, _ := readJSONMap(r)
-		util.WriteJSON(w, http.StatusOK, map[string]any{"register": a.register.Update(body)})
-	case r.URL.Path == "/api/register/start" && r.Method == http.MethodPost:
-		util.WriteJSON(w, http.StatusOK, map[string]any{"register": a.register.Start()})
-	case r.URL.Path == "/api/register/stop" && r.Method == http.MethodPost:
-		util.WriteJSON(w, http.StatusOK, map[string]any{"register": a.register.Stop()})
-	case r.URL.Path == "/api/register/reset" && r.Method == http.MethodPost:
-		util.WriteJSON(w, http.StatusOK, map[string]any{"register": a.register.Reset()})
-	default:
-		http.NotFound(w, r)
-	}
-}
-
-func (a *App) streamRegisterEvents(w http.ResponseWriter, r *http.Request) {
-	w.Header().Set("Content-Type", "text/event-stream; charset=utf-8")
-	w.Header().Set("Cache-Control", "no-cache")
-	flusher, _ := w.(http.Flusher)
-	last := ""
-	ticker := time.NewTicker(500 * time.Millisecond)
-	defer ticker.Stop()
-	for {
-		select {
-		case <-r.Context().Done():
-			return
-		case <-ticker.C:
-			payload := jsonString(a.register.Get())
-			if payload != last {
-				last = payload
-				fmt.Fprintf(w, "data: %s\n\n", payload)
-				if flusher != nil {
-					flusher.Flush()
-				}
-			}
-		}
-	}
 }
 
 func sanitizeCPAPool(pool map[string]any) map[string]any {

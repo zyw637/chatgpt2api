@@ -31,6 +31,30 @@ import (
 	"chatgpt2api/internal/version"
 )
 
+func TestReadMultipartImageBodyRejectsTooManyImages(t *testing.T) {
+	var body bytes.Buffer
+	writer := multipart.NewWriter(&body)
+	for i := 0; i < maxMultipartImageCount+1; i++ {
+		part, err := writer.CreateFormFile("image[]", fmt.Sprintf("image-%d.png", i))
+		if err != nil {
+			t.Fatalf("CreateFormFile() error = %v", err)
+		}
+		if _, err := part.Write([]byte{1}); err != nil {
+			t.Fatalf("part.Write() error = %v", err)
+		}
+	}
+	if err := writer.Close(); err != nil {
+		t.Fatalf("writer.Close() error = %v", err)
+	}
+	req := httptest.NewRequest(http.MethodPost, "/v1/images/edits", &body)
+	req.Header.Set("Content-Type", writer.FormDataContentType())
+
+	_, _, err := readMultipartImageBody(req)
+	if err == nil || !strings.Contains(err.Error(), "at most 16") {
+		t.Fatalf("readMultipartImageBody() error = %v", err)
+	}
+}
+
 func TestAppAuthAndSPACompatibility(t *testing.T) {
 	originalVersion := version.Version
 	version.Version = "test-build"
@@ -200,7 +224,7 @@ func TestAppAuthAndSPACompatibility(t *testing.T) {
 		req := httptest.NewRequest(http.MethodGet, path, nil)
 		res := httptest.NewRecorder()
 		app.Handler().ServeHTTP(res, req)
-		if res.Code != http.StatusOK || !strings.Contains(res.Body.String(), `<div id="root"></div>`) {
+		if res.Code != http.StatusOK || !strings.Contains(res.Body.String(), `<div id="root">`) || !strings.Contains(res.Body.String(), `id="pwa-boot"`) {
 			t.Fatalf("%s status/body = %d %q", path, res.Code, res.Body.String())
 		}
 	}
@@ -282,8 +306,8 @@ func TestPasswordAccountLoginAndRegistrationToggle(t *testing.T) {
 	if err := json.Unmarshal(res.Body.Bytes(), &login); err != nil {
 		t.Fatalf("login json: %v", err)
 	}
-	adminToken, _ := login["token"].(string)
-	if adminToken == "" || login["role"] != service.AuthRoleAdmin || login["subject_id"] != "admin" {
+	adminCookie := findResponseCookie(res.Result(), authSessionCookieName)
+	if login["token"] != nil || adminCookie == nil || adminCookie.Value == "" || login["role"] != service.AuthRoleAdmin || login["subject_id"] != "admin" {
 		t.Fatalf("admin login body = %#v", login)
 	}
 	assertCreationConcurrentLimit(t, login, 0)
@@ -299,7 +323,7 @@ func TestPasswordAccountLoginAndRegistrationToggle(t *testing.T) {
 	}
 
 	req = httptest.NewRequest(http.MethodPost, "/api/settings", strings.NewReader(`{"registration_enabled":true}`))
-	req.Header.Set("Authorization", "Bearer "+adminToken)
+	req.AddCookie(adminCookie)
 	res = httptest.NewRecorder()
 	app.Handler().ServeHTTP(res, req)
 	if res.Code != http.StatusOK {
@@ -316,8 +340,8 @@ func TestPasswordAccountLoginAndRegistrationToggle(t *testing.T) {
 	if err := json.Unmarshal(res.Body.Bytes(), &registered); err != nil {
 		t.Fatalf("register json: %v", err)
 	}
-	userToken, _ := registered["token"].(string)
-	if userToken == "" || registered["role"] != service.AuthRoleUser || registered["name"] != "Alice" {
+	userCookie := findResponseCookie(res.Result(), authSessionCookieName)
+	if registered["token"] != nil || userCookie == nil || userCookie.Value == "" || registered["role"] != service.AuthRoleUser || registered["name"] != "Alice" {
 		t.Fatalf("register body = %#v", registered)
 	}
 	if registered["role_id"] != service.DefaultManagedRoleID {
@@ -326,7 +350,7 @@ func TestPasswordAccountLoginAndRegistrationToggle(t *testing.T) {
 	assertCreationConcurrentLimit(t, registered, 2)
 
 	req = httptest.NewRequest(http.MethodGet, "/auth/session", nil)
-	req.Header.Set("Authorization", "Bearer "+userToken)
+	req.AddCookie(userCookie)
 	res = httptest.NewRecorder()
 	app.Handler().ServeHTTP(res, req)
 	if res.Code != http.StatusOK {
@@ -398,6 +422,30 @@ func TestProfileAccountNameAndPasswordUpdates(t *testing.T) {
 	app.Handler().ServeHTTP(res, req)
 	if res.Code != http.StatusOK {
 		t.Fatalf("password update status = %d body = %s", res.Code, res.Body.String())
+	}
+	if err := json.Unmarshal(res.Body.Bytes(), &profile); err != nil {
+		t.Fatalf("password update json: %v", err)
+	}
+	if profile["token"] != nil {
+		t.Fatalf("password update leaked token: %#v", profile)
+	}
+	rotatedCookie := findResponseCookie(res.Result(), authSessionCookieName)
+	if rotatedCookie == nil || rotatedCookie.Value == "" || rotatedCookie.Value == token {
+		t.Fatalf("password update cookie = %#v, old token = %q", rotatedCookie, token)
+	}
+	req = httptest.NewRequest(http.MethodGet, "/auth/session", nil)
+	req.Header.Set("Authorization", "Bearer "+token)
+	res = httptest.NewRecorder()
+	app.Handler().ServeHTTP(res, req)
+	if res.Code != http.StatusUnauthorized {
+		t.Fatalf("old session after password update status = %d body = %s", res.Code, res.Body.String())
+	}
+	req = httptest.NewRequest(http.MethodGet, "/auth/session", nil)
+	req.AddCookie(rotatedCookie)
+	res = httptest.NewRecorder()
+	app.Handler().ServeHTTP(res, req)
+	if res.Code != http.StatusOK {
+		t.Fatalf("rotated session status = %d body = %s", res.Code, res.Body.String())
 	}
 
 	req = httptest.NewRequest(http.MethodPost, "/auth/login", strings.NewReader(`{"username":"alice","password":"Password123"}`))
@@ -1656,7 +1704,7 @@ func TestRBACPermissionsGateManagementAPIs(t *testing.T) {
 		t.Fatalf("CreateRole() error = %v", err)
 	}
 	userID := user["id"].(string)
-	updated := app.auth.UpdateUser(userID, map[string]any{"role_id": role["id"]})
+	updated, _ := app.auth.UpdateUser(userID, map[string]any{"role_id": role["id"]})
 	if updated == nil {
 		t.Fatal("UpdateUser() returned nil")
 	}
@@ -1906,7 +1954,7 @@ func TestRBACImageDeletePermissionAllowsDelegatedUser(t *testing.T) {
 	if err != nil {
 		t.Fatalf("CreateRole() error = %v", err)
 	}
-	updated := app.auth.UpdateUser(user["id"].(string), map[string]any{"role_id": role["id"]})
+	updated, _ := app.auth.UpdateUser(user["id"].(string), map[string]any{"role_id": role["id"]})
 	if updated == nil {
 		t.Fatal("UpdateUser() returned nil")
 	}
@@ -2476,6 +2524,26 @@ func TestManagedImageThumbnailsRequireOwnerOrPublicAccess(t *testing.T) {
 	}
 }
 
+func TestReadLoginPageImageRejectsSVG(t *testing.T) {
+	var body bytes.Buffer
+	writer := multipart.NewWriter(&body)
+	part, err := writer.CreateFormFile("login_page_image_file", "attack.svg")
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, _ = part.Write([]byte(`<svg xmlns="http://www.w3.org/2000/svg"><script>alert(1)</script></svg>`))
+	_ = writer.Close()
+	req := httptest.NewRequest(http.MethodPost, "/", &body)
+	req.Header.Set("Content-Type", writer.FormDataContentType())
+	if err := req.ParseMultipartForm(maxLoginPageImageSize); err != nil {
+		t.Fatal(err)
+	}
+	header := req.MultipartForm.File["login_page_image_file"][0]
+	if _, _, err := readLoginPageImageFile(header); err == nil {
+		t.Fatal("SVG login image was accepted")
+	}
+}
+
 func TestAuthSessionCookieLifecycle(t *testing.T) {
 	app := newTestApp(t)
 	defer app.Close()
@@ -2505,6 +2573,88 @@ func TestAuthSessionCookieLifecycle(t *testing.T) {
 	if cleared == nil || cleared.MaxAge >= 0 || cleared.Value != "" {
 		t.Fatalf("logout cookie = %#v", cleared)
 	}
+	req = httptest.NewRequest(http.MethodGet, "/auth/session", nil)
+	req.AddCookie(cookie)
+	res = httptest.NewRecorder()
+	app.Handler().ServeHTTP(res, req)
+	if res.Code != http.StatusUnauthorized {
+		t.Fatalf("session after logout status = %d body = %s, want 401", res.Code, res.Body.String())
+	}
+}
+
+func TestLogoutRevokesOnlyCurrentDeviceSession(t *testing.T) {
+	app := newTestApp(t)
+	defer app.Close()
+
+	login := func() *http.Cookie {
+		t.Helper()
+		req := httptest.NewRequest(http.MethodPost, "/auth/login", strings.NewReader(`{"username":"`+testAdminUsername+`","password":"`+testAdminPassword+`"}`))
+		res := httptest.NewRecorder()
+		app.Handler().ServeHTTP(res, req)
+		if res.Code != http.StatusOK {
+			t.Fatalf("login status = %d body = %s", res.Code, res.Body.String())
+		}
+		cookie := findResponseCookie(res.Result(), authSessionCookieName)
+		if cookie == nil || cookie.Value == "" {
+			t.Fatalf("login cookie = %#v", cookie)
+		}
+		return cookie
+	}
+	deviceA := login()
+	deviceB := login()
+	if deviceA.Value == deviceB.Value {
+		t.Fatal("two device logins reused the same session token")
+	}
+
+	req := httptest.NewRequest(http.MethodPost, "/auth/logout", nil)
+	req.AddCookie(deviceB)
+	req.Header.Set("Authorization", "Bearer "+deviceA.Value)
+	res := httptest.NewRecorder()
+	app.Handler().ServeHTTP(res, req)
+	if res.Code != http.StatusOK {
+		t.Fatalf("mixed-credential logout status = %d body = %s", res.Code, res.Body.String())
+	}
+
+	req = httptest.NewRequest(http.MethodGet, "/auth/session", nil)
+	req.AddCookie(deviceB)
+	res = httptest.NewRecorder()
+	app.Handler().ServeHTTP(res, req)
+	if res.Code != http.StatusUnauthorized {
+		t.Fatalf("cookie session survived mixed-credential logout: status = %d", res.Code)
+	}
+	req = httptest.NewRequest(http.MethodGet, "/auth/session", nil)
+	req.AddCookie(deviceA)
+	res = httptest.NewRecorder()
+	app.Handler().ServeHTTP(res, req)
+	if res.Code != http.StatusOK {
+		t.Fatalf("bearer session was revoked instead of cookie session: status = %d", res.Code)
+	}
+
+	req = httptest.NewRequest(http.MethodPost, "/auth/logout", nil)
+	req.AddCookie(deviceA)
+	res = httptest.NewRecorder()
+	app.Handler().ServeHTTP(res, req)
+	if res.Code != http.StatusOK {
+		t.Fatalf("device A logout status = %d body = %s", res.Code, res.Body.String())
+	}
+
+	for name, test := range map[string]struct {
+		cookie *http.Cookie
+		status int
+	}{
+		"device A": {cookie: deviceA, status: http.StatusUnauthorized},
+		"device B": {cookie: deviceB, status: http.StatusUnauthorized},
+	} {
+		t.Run(name, func(t *testing.T) {
+			req := httptest.NewRequest(http.MethodGet, "/auth/session", nil)
+			req.AddCookie(test.cookie)
+			res := httptest.NewRecorder()
+			app.Handler().ServeHTTP(res, req)
+			if res.Code != test.status {
+				t.Fatalf("session status = %d body = %s, want %d", res.Code, res.Body.String(), test.status)
+			}
+		})
+	}
 }
 
 func TestLoginAllowsCredentialedLoopbackFrontend(t *testing.T) {
@@ -2527,6 +2677,22 @@ func TestLoginAllowsCredentialedLoopbackFrontend(t *testing.T) {
 	}
 	if cookie := findResponseCookie(res.Result(), authSessionCookieName); cookie == nil || cookie.Value == "" {
 		t.Fatalf("login cookie = %#v", cookie)
+	}
+}
+
+func TestCredentialedCORSRejectsDifferentPortAndScheme(t *testing.T) {
+	t.Setenv("CORS_ALLOWED_ORIGINS", "")
+	app := newTestApp(t)
+	defer app.Close()
+	for _, origin := range []string{"http://localhost:3000", "https://localhost:5173"} {
+		req := httptest.NewRequest(http.MethodOptions, "/auth/login", nil)
+		req.Host = "localhost:8000"
+		req.Header.Set("Origin", origin)
+		res := httptest.NewRecorder()
+		app.Handler().ServeHTTP(res, req)
+		if got := res.Header().Get("Access-Control-Allow-Credentials"); got != "" {
+			t.Fatalf("origin %q received credential permission %q", origin, got)
+		}
 	}
 }
 
@@ -2723,7 +2889,7 @@ func TestProfileAPIKeyIsPersonalAndPermissionIndependent(t *testing.T) {
 	if err != nil {
 		t.Fatalf("CreateRole() error = %v", err)
 	}
-	if updated := app.auth.UpdateUser(user.ID, map[string]any{"role_id": role["id"]}); updated == nil {
+	if updated, _ := app.auth.UpdateUser(user.ID, map[string]any{"role_id": role["id"]}); updated == nil {
 		t.Fatal("UpdateUser(role) returned nil")
 	}
 	_, userSession, err := app.auth.LoginPassword("alice", "Password123")
@@ -2830,7 +2996,7 @@ func TestProfilePromptFavoritesArePersonalAndPermissionIndependent(t *testing.T)
 	if err != nil {
 		t.Fatalf("CreateRole() error = %v", err)
 	}
-	if updated := app.auth.UpdateUser(user.ID, map[string]any{"role_id": role["id"]}); updated == nil {
+	if updated, _ := app.auth.UpdateUser(user.ID, map[string]any{"role_id": role["id"]}); updated == nil {
 		t.Fatal("UpdateUser(role) returned nil")
 	}
 	_, aliceToken, err := app.auth.LoginPassword("alice", "Password123")
@@ -3401,13 +3567,16 @@ func TestLinuxDoOAuthCallbackCreatesSession(t *testing.T) {
 	if err != nil {
 		t.Fatalf("parse callback fragment: %v", err)
 	}
-	sessionKey := fragment.Get("key")
-	if sessionKey == "" || fragment.Get("subject_id") != "linuxdo:123" || fragment.Get("redirect") != "/settings" {
+	if fragment.Get("key") != "" || fragment.Get("subject_id") != "linuxdo:123" || fragment.Get("redirect") != "/settings" {
 		t.Fatalf("callback fragment = %#v", fragment)
+	}
+	sessionCookie := findResponseCookie(res.Result(), authSessionCookieName)
+	if sessionCookie == nil || sessionCookie.Value == "" {
+		t.Fatalf("callback session cookie = %#v", sessionCookie)
 	}
 
 	req = httptest.NewRequest(http.MethodGet, "/auth/session", nil)
-	req.Header.Set("Authorization", "Bearer "+sessionKey)
+	req.AddCookie(sessionCookie)
 	res = httptest.NewRecorder()
 	app.Handler().ServeHTTP(res, req)
 	if res.Code != http.StatusOK {
@@ -3554,8 +3723,11 @@ func TestLinuxDoOAuthCallbackRejectsNewUserWhenRegistrationDisabled(t *testing.T
 	if err != nil {
 		t.Fatalf("parse second callback fragment: %v", err)
 	}
-	if fragment.Get("error") != "" || fragment.Get("key") == "" || fragment.Get("subject_id") != "linuxdo:456" {
+	if fragment.Get("error") != "" || fragment.Get("key") != "" || fragment.Get("subject_id") != "linuxdo:456" {
 		t.Fatalf("existing user callback fragment = %#v", fragment)
+	}
+	if cookie := findResponseCookie(res.Result(), authSessionCookieName); cookie == nil || cookie.Value == "" {
+		t.Fatalf("existing user callback session cookie = %#v", cookie)
 	}
 }
 
